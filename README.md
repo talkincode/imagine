@@ -25,6 +25,16 @@ First backends: Azure `gpt-image-1.5`, `gpt-image-2` (image generations) and
 
 ## Install
 
+### Homebrew (macOS / Linux)
+
+```bash
+brew install talkincode/tap/imagine
+```
+
+This pulls prebuilt binaries from the [talkincode/homebrew-tap](https://github.com/talkincode/homebrew-tap) repository, updated automatically on every tagged release.
+
+### One-liner (Linux / macOS)
+
 One-liner for Linux / macOS (auto-detects OS/arch, downloads the prebuilt
 binary and agent skill from the GitHub release, and verifies their SHA-256 —
 no compilation):

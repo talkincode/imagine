@@ -42,11 +42,14 @@ Explain that installation will place the binary in `~/.local/bin` and the agent
 skill in `~/.agents/skills/imagine`. After the user approves, use one of these:
 
 ```bash
-# Option A: one-line install, recommended. It auto-detects OS/arch, downloads
-# prebuilt artifacts from the GitHub release, and verifies SHA-256 checksums.
+# Option A: Homebrew (macOS / Linux), recommended:
+brew install talkincode/tap/imagine
+
+# Option B: one-line install. It auto-detects OS/arch, downloads prebuilt
+# artifacts from the GitHub release, and verifies SHA-256 checksums.
 curl -fsSL https://raw.githubusercontent.com/talkincode/imagine/main/install.sh | sh
 
-# Option B: source install for development or unsupported prebuilt platforms.
+# Option C: source install for development or unsupported prebuilt platforms.
 # Requires Zig >= 0.16.0.
 make install
 ```

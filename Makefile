@@ -125,6 +125,9 @@ dist: ## Cross-compile all release binaries + skill + checksums into dist/
 	done
 	@rm -rf "$(DIST_DIR)/.stage"
 	@tar -czf "$(DIST_DIR)/imagine-skill.tar.gz" -C skills imagine
+	@for target in imagine-linux-x86_64 imagine-linux-aarch64 imagine-macos-x86_64 imagine-macos-aarch64; do \
+	  tar -czf "$(DIST_DIR)/$${target}.tar.gz" -C "$(DIST_DIR)" "$$target" -C . skills; \
+	done
 	@cd "$(DIST_DIR)" && { sha256sum imagine-* > SHA256SUMS 2>/dev/null || shasum -a 256 imagine-* > SHA256SUMS; }
 	@echo "" && echo "dist -> $(DIST_DIR)/" && ls -1 "$(DIST_DIR)"
 
