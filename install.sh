@@ -1,14 +1,14 @@
 #!/bin/sh
 # imagine installer — POSIX sh, curl-pipeable.
 #
-#   curl -fsSL https://raw.githubusercontent.com/jamiesun/imagine/main/install.sh | sh
+#   curl -fsSL https://raw.githubusercontent.com/talkincode/imagine/main/install.sh | sh
 #
 # Downloads the prebuilt `imagine` binary and agent skill for your platform
 # from the GitHub Releases and installs them. No compilation — it pulls the
 # released artifacts directly and verifies their SHA-256. Detects OS/arch.
 # Override anything with the env vars:
 #
-#   IMAGINE_REPO        GitHub repo            (default jamiesun/imagine)
+#   IMAGINE_REPO        GitHub repo            (default talkincode/imagine)
 #   IMAGINE_VERSION     release tag to install (default latest, e.g. v0.1.0)
 #   IMAGINE_BIN_DIR     binary install dir     (default $HOME/.local/bin)
 #   IMAGINE_AGENTS_DIR  agents dir             (default $HOME/.agents)
@@ -22,7 +22,7 @@
 
 set -eu
 
-REPO="${IMAGINE_REPO:-jamiesun/imagine}"
+REPO="${IMAGINE_REPO:-talkincode/imagine}"
 VERSION="${IMAGINE_VERSION:-latest}"
 BIN_DIR="${IMAGINE_BIN_DIR:-$HOME/.local/bin}"
 AGENTS_DIR="${IMAGINE_AGENTS_DIR:-$HOME/.agents}"

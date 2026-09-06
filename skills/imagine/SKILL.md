@@ -44,7 +44,7 @@ skill in `~/.agents/skills/imagine`. After the user approves, use one of these:
 ```bash
 # Option A: one-line install, recommended. It auto-detects OS/arch, downloads
 # prebuilt artifacts from the GitHub release, and verifies SHA-256 checksums.
-curl -fsSL https://raw.githubusercontent.com/jamiesun/imagine/main/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/talkincode/imagine/main/install.sh | sh
 
 # Option B: source install for development or unsupported prebuilt platforms.
 # Requires Zig >= 0.16.0.
@@ -57,7 +57,7 @@ again with `imagine version`.
 Linux and macOS can use the one-line installer. Windows users should download
 `imagine-windows-x86_64.exe` or `imagine-windows-aarch64.exe` from the latest
 release and put it on PATH. The one-line installer only downloads prebuilt
-artifacts; use `IMAGINE_VERSION=v0.1.1` to pin a release. If no prebuilt binary
+artifacts; use `IMAGINE_VERSION=v0.1.2` to pin a release. If no prebuilt binary
 exists for the platform, build from source with Zig >= 0.16.0.
 
 ## Step 1: Configure
