@@ -212,53 +212,53 @@ jobs:
           mkdir -p tap/Formula
 
           cat > tap/Formula/imagine.rb <<EOF
-class Imagine < Formula
-  desc "Universal image-generation CLI for AI agents"
-  homepage "https://github.com/${GITHUB_REPOSITORY}"
-  version "${VERSION}"
-  license "MIT"
+          class Imagine < Formula
+            desc "Universal image-generation CLI for AI agents"
+            homepage "https://github.com/${GITHUB_REPOSITORY}"
+            version "${VERSION}"
+            license "MIT"
 
-  on_macos do
-    if Hardware::CPU.arm?
-      url "${BASE_URL}/imagine-macos-aarch64.tar.gz"
-      sha256 "${MACOS_ARM64_SHA}"
-    else
-      url "${BASE_URL}/imagine-macos-x86_64.tar.gz"
-      sha256 "${MACOS_AMD64_SHA}"
-    end
-  end
+            on_macos do
+              if Hardware::CPU.arm?
+                url "${BASE_URL}/imagine-macos-aarch64.tar.gz"
+                sha256 "${MACOS_ARM64_SHA}"
+              else
+                url "${BASE_URL}/imagine-macos-x86_64.tar.gz"
+                sha256 "${MACOS_AMD64_SHA}"
+              end
+            end
 
-  on_linux do
-    if Hardware::CPU.arm?
-      url "${BASE_URL}/imagine-linux-aarch64.tar.gz"
-      sha256 "${LINUX_ARM64_SHA}"
-    else
-      url "${BASE_URL}/imagine-linux-x86_64.tar.gz"
-      sha256 "${LINUX_AMD64_SHA}"
-    end
-  end
+            on_linux do
+              if Hardware::CPU.arm?
+                url "${BASE_URL}/imagine-linux-aarch64.tar.gz"
+                sha256 "${LINUX_ARM64_SHA}"
+              else
+                url "${BASE_URL}/imagine-linux-x86_64.tar.gz"
+                sha256 "${LINUX_AMD64_SHA}"
+              end
+            end
 
-  def install
-    bin.install Dir["imagine-*"].find { |f| File.file?(f) && File.executable?(f) } => "imagine"
-    pkgshare.install "skills" if File.directory?("skills")
-  end
+            def install
+              bin.install Dir["imagine-*"].find { |f| File.file?(f) && File.executable?(f) } => "imagine"
+              pkgshare.install "skills" if File.directory?("skills")
+            end
 
-  def caveats
-    <<~EOS
-      The agent skill has been installed to:
-        #{opt_pkgshare}/skills/imagine
+            def caveats
+              <<~EOS
+                The agent skill has been installed to:
+                  #{opt_pkgshare}/skills/imagine
 
-      To use it with your AI agent, link or copy it to your skills folder:
-        mkdir -p ~/.agents/skills
-        cp -R #{opt_pkgshare}/skills/imagine ~/.agents/skills/
-    EOS
-  end
+                To use it with your AI agent, link or copy it to your skills folder:
+                  mkdir -p ~/.agents/skills
+                  cp -R #{opt_pkgshare}/skills/imagine ~/.agents/skills/
+              EOS
+            end
 
-  test do
-    assert_match version.to_s, shell_output("#{bin}/imagine version")
-  end
-end
-EOF
+            test do
+              assert_match version.to_s, shell_output("#{bin}/imagine version")
+            end
+          end
+          EOF
 
           cd tap
           git config user.name "github-actions[bot]"
