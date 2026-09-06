@@ -45,7 +45,7 @@ curl -fsSL https://raw.githubusercontent.com/talkincode/imagine/main/install.sh 
 
 This installs the `imagine` binary to `~/.local/bin` and the agent skill to
 `~/.agents/skills/imagine`. Override with `IMAGINE_BIN_DIR`, `IMAGINE_AGENTS_DIR`,
-or pin a release with `IMAGINE_VERSION=v0.1.2`.
+or pin a release with `IMAGINE_VERSION=v0.1.3`.
 
 **Windows:** download `imagine-windows-x86_64.exe` (or `-aarch64`) from the
 [latest release](https://github.com/talkincode/imagine/releases/latest) and put
