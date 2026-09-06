@@ -95,6 +95,7 @@ jobs:
       - name: Package archives, skill + checksums
         shell: bash
         run: |
+          chmod +x dist/imagine-*
           tar -czf dist/imagine-skill.tar.gz -C skills imagine
           for target in imagine-linux-x86_64 imagine-linux-aarch64 imagine-macos-x86_64 imagine-macos-aarch64; do
             tar -czf "dist/${target}.tar.gz" -C dist "$target" -C "$GITHUB_WORKSPACE" skills
@@ -189,10 +190,8 @@ jobs:
           VERSION="${TAG#v}"
           BASE_URL="https://github.com/${GITHUB_REPOSITORY}/releases/download/${TAG}"
 
-          for target in imagine-linux-x86_64 imagine-linux-aarch64 imagine-macos-x86_64 imagine-macos-aarch64; do
-            tar -czf "dist/${target}.tar.gz" -C dist "$target" -C "$GITHUB_WORKSPACE" skills
-          done
-          ( cd dist && sha256sum imagine-* > SHA256SUMS )
+          mkdir -p dist
+          curl -fsSL "${BASE_URL}/SHA256SUMS" -o dist/SHA256SUMS
           CHECKSUMS="dist/SHA256SUMS"
 
           sha() {
@@ -239,7 +238,7 @@ jobs:
             end
 
             def install
-              bin.install Dir["imagine-*"].find { |f| File.file?(f) && File.executable?(f) } => "imagine"
+              bin.install Dir["imagine-*"].find { |f| File.file?(f) } => "imagine"
               pkgshare.install "skills" if File.directory?("skills")
             end
 
