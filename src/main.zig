@@ -110,7 +110,7 @@ fn cmdConfigInit(ctx: Ctx, c: cli.ConfigInit) !u8 {
         .json => config.json_template,
     };
     try cwd.writeFile(ctx.io, .{ .sub_path = path, .data = data });
-    try outf(ctx, "wrote starter {s} config to {s}\nedit it, then set your API key (default env: AZURE_API_KEY)\n", .{ fmt.toString(), path });
+    try outf(ctx, "wrote starter {s} config to {s}\nedit model names/URLs, then set your API key (default env: AZURE_OPENAI_APIKEY)\nrun `imagine models` to list configured models\n", .{ fmt.toString(), path });
     return 0;
 }
 
@@ -161,6 +161,7 @@ fn cmdConfigShow(ctx: Ctx, c: cli.Common) !u8 {
         defaults: types.ModelDefaults,
     };
     const Show = struct {
+        source: []const u8,
         config_path: ?[]const u8,
         output_dir: []const u8,
         concurrency: u32,
@@ -191,6 +192,7 @@ fn cmdConfigShow(ctx: Ctx, c: cli.Common) !u8 {
         };
     }
     const show = Show{
+        .source = cfg.source.toString(),
         .config_path = cfg.source_path,
         .output_dir = cfg.output_dir,
         .concurrency = cfg.concurrency,
@@ -212,6 +214,7 @@ fn cmdModels(ctx: Ctx, c: cli.Common) !u8 {
             api_model: []const u8,
             endpoints: usize,
             ready: bool,
+            source: []const u8,
         };
         var items = try ctx.arena.alloc(Item, cfg.models.len);
         for (cfg.models, 0..) |m, i| {
@@ -221,6 +224,7 @@ fn cmdModels(ctx: Ctx, c: cli.Common) !u8 {
                 .api_model = m.api_model,
                 .endpoints = m.endpoints.len,
                 .ready = modelReady(m),
+                .source = cfg.source.toString(),
             };
         }
         const json = try std.json.Stringify.valueAlloc(ctx.arena, items, .{ .whitespace = .indent_2 });
@@ -228,7 +232,7 @@ fn cmdModels(ctx: Ctx, c: cli.Common) !u8 {
         return 0;
     }
 
-    try outf(ctx, "configured models ({d}):\n", .{cfg.models.len});
+    try outf(ctx, "configured models ({d}, source={s}):\n", .{ cfg.models.len, cfg.source.toString() });
     for (cfg.models) |m| {
         const ready = if (modelReady(m)) "ready" else "no key";
         try outf(ctx, "  {s:<16} backend={s:<12} endpoints={d} [{s}]\n", .{ m.name, m.backend.toString(), m.endpoints.len, ready });
@@ -251,7 +255,7 @@ fn cmdGenerate(ctx: Ctx, g: cli.Generate) !u8 {
     var cfg = loadConfig(ctx, g.common.config_path) catch |e| return reportConfigError(ctx, e, g.common.config_path);
     defer cfg.deinit();
 
-    const model = cfg.findModel(g.model.?) orelse return reportUnknownModel(ctx, &cfg, g.model.?);
+    const model = (try resolveModel(ctx, &cfg, g.model)) orelse return 2;
 
     var req = types.ImageRequest{
         .prompt = g.prompt.?,
@@ -682,16 +686,62 @@ fn expandPath(ctx: Ctx, path: []const u8) ![]u8 {
 }
 
 fn loadConfig(ctx: Ctx, explicit: ?[]const u8) !config.Config {
-    const raw = try config.resolvePath(ctx.arena, ctx.env, explicit);
+    // 1) Explicit --config: file only.
+    if (explicit) |p| {
+        const path = try expandPath(ctx, p);
+        return config.loadFromFile(ctx.gpa, ctx.io, path, ctx.env);
+    }
+
+    // 2) $IMAGINE_CONFIG: file only.
+    if (ctx.env.get(config.env_config_path)) |p| {
+        if (p.len > 0) {
+            const path = try expandPath(ctx, p);
+            return config.loadFromFile(ctx.gpa, ctx.io, path, ctx.env);
+        }
+    }
+
+    // 3) Default toml, then legacy json.
+    const raw = try config.resolvePath(ctx.arena, ctx.env, null);
     const path = try expandPath(ctx, raw);
     return config.loadFromFile(ctx.gpa, ctx.io, path, ctx.env) catch |e| {
-        if (e == error.FileNotFound and explicit == null and ctx.env.get(config.env_config_path) == null) {
-            const legacy_raw = try config.resolveLegacyJsonPath(ctx.arena, ctx.env);
-            const legacy_path = try expandPath(ctx, legacy_raw);
-            return config.loadFromFile(ctx.gpa, ctx.io, legacy_path, ctx.env);
-        }
-        return e;
+        if (e != error.FileNotFound) return e;
+
+        const legacy_raw = try config.resolveLegacyJsonPath(ctx.arena, ctx.env);
+        const legacy_path = try expandPath(ctx, legacy_raw);
+        return config.loadFromFile(ctx.gpa, ctx.io, legacy_path, ctx.env) catch |e2| {
+            if (e2 != error.FileNotFound) return e2;
+
+            // 4) Ephemeral env synthesis when no config file exists.
+            if (config.ephemeralReady(ctx.env)) {
+                return config.loadEphemeral(ctx.gpa, ctx.env);
+            }
+            if (config.ephemeralIntent(ctx.env)) {
+                return error.EphemeralIncomplete;
+            }
+            return error.FileNotFound;
+        };
     };
+}
+
+/// Pick a model by name, or the sole configured model when `--model` is omitted.
+/// For ephemeral configs, `--model` may retarget the single model's name/api_model.
+fn resolveModel(ctx: Ctx, cfg: *config.Config, requested: ?[]const u8) !?*const types.ModelConfig {
+    if (requested) |name| {
+        if (cfg.findModel(name)) |m| return m;
+        if (cfg.source == .ephemeral and cfg.models.len == 1) {
+            const m = &cfg.models[0];
+            m.name = try cfg.arena.allocator().dupe(u8, name);
+            if (!cfg.ephemeral_api_model_set) {
+                m.api_model = m.name;
+            }
+            return m;
+        }
+        _ = try reportUnknownModel(ctx, cfg, name);
+        return null;
+    }
+    if (cfg.models.len == 1) return &cfg.models[0];
+    try printErr(ctx.io, "missing required option: --model (multiple models configured; run `imagine models`)\n");
+    return null;
 }
 
 fn selectInitFormat(ctx: Ctx, requested: ?[]const u8, path: []const u8) !config.Format {
@@ -724,7 +774,12 @@ fn reportConfigError(ctx: Ctx, e: anyerror, explicit: ?[]const u8) !u8 {
     const raw = config.resolvePath(ctx.arena, ctx.env, explicit) catch "(unknown)";
     switch (e) {
         error.FileNotFound => {
-            try printErr(ctx.io, try std.fmt.allocPrint(ctx.arena, "no config found at {s}\nrun 'imagine config init' to create one\n", .{raw}));
+            const hint = try config.noConfigHint(ctx.arena, ctx.env);
+            try printErr(ctx.io, try std.fmt.allocPrint(ctx.arena, "no config found at {s}\n{s}", .{ raw, hint }));
+        },
+        error.EphemeralIncomplete, error.EphemeralNoCredential => {
+            const hint = try config.noConfigHint(ctx.arena, ctx.env);
+            try printErr(ctx.io, hint);
         },
         else => {
             try printErr(ctx.io, try std.fmt.allocPrint(ctx.arena, "failed to load config {s}: {s}\n", .{ raw, @errorName(e) }));

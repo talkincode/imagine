@@ -36,19 +36,25 @@ pub const AuthScheme = enum {
 
 /// Identifies which backend module builds a request body for a model. Adding a
 /// new provider means adding a variant here and a module under `backends/`.
+/// Logical model names are never hardcoded — they come from config.
 pub const BackendKind = enum {
-    azure_image,
+    /// OpenAI-compatible `images/generations` (Azure OpenAI, OpenAI, etc.).
+    openai_image,
+    /// Azure-hosted Black Forest Labs FLUX (width/height body).
     azure_flux,
 
     pub fn fromString(s: []const u8) ?BackendKind {
-        if (std.mem.eql(u8, s, "azure_image") or std.mem.eql(u8, s, "azure-image")) return .azure_image;
+        // openai_image is canonical; azure_image is kept as a legacy alias.
+        if (std.mem.eql(u8, s, "openai_image") or std.mem.eql(u8, s, "openai-image") or
+            std.mem.eql(u8, s, "azure_image") or std.mem.eql(u8, s, "azure-image"))
+            return .openai_image;
         if (std.mem.eql(u8, s, "azure_flux") or std.mem.eql(u8, s, "azure-flux")) return .azure_flux;
         return null;
     }
 
     pub fn toString(self: BackendKind) []const u8 {
         return switch (self) {
-            .azure_image => "azure_image",
+            .openai_image => "openai_image",
             .azure_flux => "azure_flux",
         };
     }
@@ -144,5 +150,7 @@ test "parseSize" {
 test "AuthScheme/BackendKind round trips" {
     try std.testing.expectEqual(AuthScheme.bearer, AuthScheme.fromString("bearer").?);
     try std.testing.expectEqual(AuthScheme.api_key, AuthScheme.fromString("api-key").?);
+    try std.testing.expectEqual(BackendKind.openai_image, BackendKind.fromString("openai_image").?);
+    try std.testing.expectEqual(BackendKind.openai_image, BackendKind.fromString("azure_image").?);
     try std.testing.expectEqual(BackendKind.azure_flux, BackendKind.fromString("azure-flux").?);
 }

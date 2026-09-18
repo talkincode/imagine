@@ -1,6 +1,9 @@
-//! Azure OpenAI image models (`gpt-image-1.5`, `gpt-image-2`).
+//! OpenAI-compatible image generation (`/v1/images/generations`).
 //!
-//! Endpoint: POST .../openai/v1/images/generations
+//! Works with Azure OpenAI, OpenAI, and any provider that speaks the same
+//! request shape. The logical model name and `api_model` come from config —
+//! this module does not hardcode provider model ids.
+//!
 //! Body uses a `size` string ("WxH") plus optional output controls. Only the
 //! request-body construction lives here; auth, transport and response parsing
 //! are handled generically in `backend.zig`.
@@ -41,11 +44,11 @@ pub fn buildBody(allocator: std.mem.Allocator, req: types.ImageRequest) ![]u8 {
     return std.json.Stringify.valueAlloc(allocator, body, .{ .emit_null_optional_fields = false });
 }
 
-test "azure_image body omits nulls" {
+test "openai_image body omits nulls" {
     const a = std.testing.allocator;
     const req = types.ImageRequest{
         .prompt = "a fox",
-        .api_model = "gpt-image-1.5",
+        .api_model = "my-deployment",
         .n = 1,
         .size = "1024x1024",
         .output_format = "png",
@@ -54,15 +57,15 @@ test "azure_image body omits nulls" {
     const body = try buildBody(a, req);
     defer a.free(body);
     try std.testing.expect(std.mem.indexOf(u8, body, "\"prompt\":\"a fox\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, body, "\"model\":\"gpt-image-1.5\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"model\":\"my-deployment\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, body, "\"size\":\"1024x1024\"") != null);
     // quality was null -> must be omitted
     try std.testing.expect(std.mem.indexOf(u8, body, "quality") == null);
 }
 
-test "azure_image derives size from width/height" {
+test "openai_image derives size from width/height" {
     const a = std.testing.allocator;
-    const req = types.ImageRequest{ .prompt = "x", .api_model = "gpt-image-2", .n = 1, .width = 512, .height = 768 };
+    const req = types.ImageRequest{ .prompt = "x", .api_model = "img", .n = 1, .width = 512, .height = 768 };
     const body = try buildBody(a, req);
     defer a.free(body);
     try std.testing.expect(std.mem.indexOf(u8, body, "\"size\":\"512x768\"") != null);

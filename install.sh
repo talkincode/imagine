@@ -159,6 +159,7 @@ case ":$PATH:" in
      printf '       export PATH="%s:$PATH"\n' "$BIN_DIR" ;;
 esac
 printf '\nNext steps:\n'
-printf '  1. imagine config init       # write ~/.imagine/config.json\n'
-printf '  2. export AZURE_API_KEY=...   # or edit the config\n'
-printf '  3. imagine generate -m gpt-image-1.5 -p "a red fox in autumn" -o fox.png\n'
+printf '  1. imagine config init                 # write ~/.imagine/config.toml\n'
+printf '  2. export AZURE_OPENAI_APIKEY=...      # or edit api_key_env in config\n'
+printf '  3. imagine models                      # list configured models\n'
+printf '  4. imagine generate -m <model> -p "..." -o out.png\n'

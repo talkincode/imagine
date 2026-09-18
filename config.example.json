@@ -2,18 +2,18 @@
   "output_dir": "~/.imagine/outputs",
   "concurrency": 0,
   "models": {
-    "gpt-image-1.5": {
-      "backend": "azure_image",
-      "api_model": "gpt-image-1.5",
+    "MAI-Image-2.6": {
+      "backend": "openai_image",
+      "api_model": "MAI-Image-2.6",
       "endpoints": [
         {
-          "base_url": "https://your-resource.services.ai.azure.com/openai/v1/images/generations",
-          "api_key_env": "AZURE_API_KEY",
+          "base_url": "https://jettai2.services.ai.azure.com/mai/v1/images/generations",
+          "api_key_env": "AZURE_OPENAI_APIKEY",
           "auth": "bearer"
         },
         {
-          "base_url": "https://your-resource-2.services.ai.azure.com/openai/v1/images/generations",
-          "api_key_env": "AZURE_API_KEY_2",
+          "base_url": "https://jettai2.services.ai.azure.com/mai/v1/images/generations",
+          "api_key_env": "AZURE_OPENAI_APIKEY_2",
           "auth": "bearer"
         }
       ],
@@ -24,35 +24,38 @@
         "quality": "high"
       }
     },
-    "gpt-image-2": {
-      "backend": "azure_image",
-      "api_model": "gpt-image-2",
+    "MAI-Image-2.5": {
+      "backend": "openai_image",
+      "api_model": "MAI-Image-2.5",
       "endpoints": [
         {
-          "base_url": "https://your-resource.services.ai.azure.com/openai/v1/images/generations",
-          "api_key_env": "AZURE_API_KEY",
-          "auth": "api-key"
+          "base_url": "https://jettai2.services.ai.azure.com/mai/v1/images/generations",
+          "api_key_env": "AZURE_OPENAI_APIKEY",
+          "auth": "bearer"
         }
       ],
       "defaults": {
         "size": "1024x1024",
         "output_format": "png",
-        "output_compression": 100
+        "output_compression": 100,
+        "quality": "high"
       }
     },
-    "FLUX.2-pro": {
-      "backend": "azure_flux",
-      "api_model": "FLUX.2-pro",
+    "MAI-Image-2.6-Flash": {
+      "backend": "openai_image",
+      "api_model": "MAI-Image-2.6-Flash",
       "endpoints": [
         {
-          "base_url": "https://your-resource.services.ai.azure.com/providers/blackforestlabs/v1/flux-2-pro?api-version=preview",
-          "api_key_env": "AZURE_API_KEY",
+          "base_url": "https://jettai2.services.ai.azure.com/mai/v1/images/generations",
+          "api_key_env": "AZURE_OPENAI_APIKEY",
           "auth": "bearer"
         }
       ],
       "defaults": {
-        "width": 1024,
-        "height": 1024
+        "size": "1024x1024",
+        "output_format": "png",
+        "output_compression": 100,
+        "quality": "high"
       }
     }
   }

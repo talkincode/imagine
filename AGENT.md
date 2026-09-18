@@ -33,8 +33,8 @@
 | `util.zig` | base64 解码、`~` 展开、扩展名、时间戳、key 脱敏、路径数字后缀 | 不含业务逻辑 |
 | `config.zig` | 解析 JSON 配置、解析路径、`template`、`Env` 接口、从 env 取 key | 不直接读 `std.process`（通过 `Env` vtable 注入，便于测试） |
 | `http.zig` | `std.http.Client` 薄封装：`post`/`get` → `Response{status,body}` | 不懂任何模型语义 |
-| `backends/azure_image.zig` | gpt-image-* 请求体（`size` 字符串） | 只构造 body，不发请求 |
-| `backends/azure_flux.zig` | FLUX 请求体（`width`/`height`，可选 `seed`） | 同上 |
+| `backends/openai_image.zig` | OpenAI-compatible `/v1/images/generations` 请求体（`size` 字符串） | 只构造 body，不发请求 |
+| `backends/azure_flux.zig` | Azure FLUX 请求体（`width`/`height`，可选 `seed`） | 同上 |
 | `backend.zig` | 后端注册 + `generate()` 编排 + 共享响应解析（b64_json / url 回退 / error） | 不解析 CLI、不写文件 |
 | `scheduler.zig` | 并发任务执行（`std.Thread` 原子认领）、落盘、进度上报 | 不构造请求体、不解析 CLI |
 | `cli.zig` | 参数解析 + help 文本 | 不发网络请求 |
@@ -57,13 +57,14 @@
 output_dir = "~/.imagine/outputs"
 concurrency = 0 # 0=按端点数自动；>0 固定并发
 
+# 表键即 -m 的逻辑名，可自由增删改；模型名不写死在二进制里。
 [models."<model-name>"]
-backend = "azure_image" # azure_image | azure_flux
+backend = "openai_image" # openai_image | azure_flux（azure_image 为兼容别名）
 api_model = "传给 API 的真实 model 字段"
 
 [[models."<model-name>".endpoints]]
 base_url = "https://.../images/generations"
-api_key_env = "AZURE_API_KEY" # 从环境变量取 key
+api_key_env = "AZURE_OPENAI_APIKEY" # 从环境变量取 key
 api_key = "可选：直接写死 key（优先于 env）"
 auth = "bearer" # bearer | api-key，默认 bearer
 
@@ -78,6 +79,19 @@ quality = "high"
 
 参数优先级：**CLI 选项 > 模型 `defaults` > 内置缺省**。
 密钥优先级：端点 `api_key` > 端点 `api_key_env` 指向的环境变量。
+
+### 无配置文件（ephemeral）
+
+当 `--config` / `$IMAGINE_CONFIG` / 默认 toml / legacy json **均不存在**时，可从 env 合成单模型：
+
+| 变量 | 含义 |
+|------|------|
+| `IMAGINE_BASE_URL` | 必填，images endpoint |
+| `IMAGINE_MODEL` | 必填，逻辑名（兼默认 api_model） |
+| `AZURE_OPENAI_APIKEY` / `IMAGINE_API_KEY` / `IMAGINE_API_KEY_ENV` | 凭证 |
+| `IMAGINE_BACKEND` / `IMAGINE_AUTH` / `IMAGINE_API_MODEL` / `IMAGINE_SIZE`… | 可选 |
+
+`imagine models` / `config show` 的 `source` 为 `ephemeral` 或 `file`。仅一个模型时可省略 `-m`。多模型/多端点仍用配置文件。
 
 ## 5. CLI 契约（对 agent 稳定）
 
@@ -99,7 +113,9 @@ imagine version | help
 
 **已完成**
 - 核心架构（types/config/http/backend/scheduler/cli/main）与单元测试。
-- Azure `gpt-image-1.5`、`gpt-image-2`（azure_image）与 `FLUX.2-pro`（azure_flux）。
+- OpenAI 兼容 `openai_image`（`/v1/images/generations`）与 Azure `azure_flux`。
+- 模型名由配置动态声明；`imagine models` 发现可用模型。默认密钥 env：`AZURE_OPENAI_APIKEY`。
+- **Ephemeral 无配置文件模式**：无文件时用 `IMAGINE_BASE_URL` + `IMAGINE_MODEL` + 凭证合成单模型；`source` 标注；单模型可省略 `-m`。
 - 同模型多端点并发调度；`--json`/`--dry-run`/batch；config init/show/path。
 - `install.sh`（curl 一键，OS 探测，下载预编译二进制并校验 SHA-256）、`Makefile`、`skills/imagine` 技能。
 - CI（Linux/macOS/Windows 构建+测试+`zig fmt`）与 release 工作流：tag 触发，交叉编译
@@ -107,7 +123,7 @@ imagine version | help
 
 **近期**
 - HTTP 超时与有界重试（指数退避，仅幂等失败）。
-- 更多后端：OpenAI 官方 `images/generations`、Google Gemini 图像、Stability、Replicate。
+- 更多后端：Google Gemini 图像、Stability、Replicate。
 - 图生图 / 编辑（input image、mask）参数通路。
 
 **远期**

@@ -2,6 +2,9 @@
 //!
 //! Config is TOML at `~/.imagine/config.toml` by default (override with
 //! `$IMAGINE_CONFIG` or `--config`). Legacy JSON configs are still accepted.
+//! When no config file exists, a single-model **ephemeral** config can be
+//! synthesized from environment variables (`IMAGINE_BASE_URL`, etc.).
+//!
 //! The file declares logical models, each mapping to a backend
 //! and one-or-more endpoints (url + credential). Multiple endpoints on a model
 //! are what allow the scheduler to fan a single model's work across keys.
@@ -19,6 +22,24 @@ pub const default_rel_path = ".imagine/config.toml";
 pub const legacy_json_rel_path = ".imagine/config.json";
 pub const env_config_path = "IMAGINE_CONFIG";
 
+/// Ephemeral (no-file) config env vars.
+pub const env_base_url = "IMAGINE_BASE_URL";
+pub const env_model = "IMAGINE_MODEL";
+pub const env_api_model = "IMAGINE_API_MODEL";
+pub const env_backend = "IMAGINE_BACKEND";
+pub const env_auth = "IMAGINE_AUTH";
+pub const env_api_key = "IMAGINE_API_KEY";
+pub const env_api_key_env = "IMAGINE_API_KEY_ENV";
+pub const env_default_api_key_env = "AZURE_OPENAI_APIKEY";
+pub const env_output_dir = "IMAGINE_OUTPUT_DIR";
+pub const env_concurrency = "IMAGINE_CONCURRENCY";
+pub const env_size = "IMAGINE_SIZE";
+pub const env_width = "IMAGINE_WIDTH";
+pub const env_height = "IMAGINE_HEIGHT";
+pub const env_format = "IMAGINE_FORMAT";
+pub const env_compression = "IMAGINE_COMPRESSION";
+pub const env_quality = "IMAGINE_QUALITY";
+
 pub const Format = enum {
     json,
     toml,
@@ -33,6 +54,18 @@ pub const Format = enum {
         return switch (self) {
             .json => "json",
             .toml => "toml",
+        };
+    }
+};
+
+pub const Source = enum {
+    file,
+    ephemeral,
+
+    pub fn toString(self: Source) []const u8 {
+        return switch (self) {
+            .file => "file",
+            .ephemeral => "ephemeral",
         };
     }
 };
@@ -75,6 +108,8 @@ pub const Error = error{
     InvalidToml,
     UnsupportedToml,
     DuplicateTomlTable,
+    EphemeralIncomplete,
+    EphemeralNoCredential,
 } || Allocator.Error || std.json.ParseError(std.json.Scanner);
 
 pub const Config = struct {
@@ -87,6 +122,9 @@ pub const Config = struct {
     /// Path the config was loaded from, if any (informational).
     source_path: ?[]const u8 = null,
     source_format: ?Format = null,
+    source: Source = .file,
+    /// When `source == .ephemeral`, whether `IMAGINE_API_MODEL` set api_model.
+    ephemeral_api_model_set: bool = false,
 
     pub fn deinit(self: *Config) void {
         self.arena.deinit();
@@ -116,6 +154,152 @@ pub fn resolvePath(arena: Allocator, env: Env, explicit: ?[]const u8) ![]u8 {
 pub fn resolveLegacyJsonPath(arena: Allocator, env: Env) ![]u8 {
     const home = env.get("HOME") orelse env.get("USERPROFILE") orelse ".";
     return std.fmt.allocPrint(arena, "{s}/{s}", .{ home, legacy_json_rel_path });
+}
+
+fn envNonEmpty(env: Env, name: []const u8) ?[]const u8 {
+    const v = env.get(name) orelse return null;
+    const t = std.mem.trim(u8, v, " \t\r\n");
+    if (t.len == 0) return null;
+    return t;
+}
+
+/// True if the caller appears to be attempting ephemeral (no-file) mode.
+pub fn ephemeralIntent(env: Env) bool {
+    return envNonEmpty(env, env_base_url) != null or
+        envNonEmpty(env, env_model) != null or
+        envNonEmpty(env, env_api_key) != null or
+        envNonEmpty(env, env_api_key_env) != null or
+        envNonEmpty(env, env_backend) != null;
+}
+
+pub const EphemeralMissing = struct {
+    base_url: bool = false,
+    model: bool = false,
+    credential: bool = false,
+};
+
+pub fn ephemeralMissing(env: Env) EphemeralMissing {
+    var m: EphemeralMissing = .{};
+    if (envNonEmpty(env, env_base_url) == null) m.base_url = true;
+    if (envNonEmpty(env, env_model) == null) m.model = true;
+
+    const has_literal = envNonEmpty(env, env_api_key) != null;
+    const key_env_name = envNonEmpty(env, env_api_key_env) orelse env_default_api_key_env;
+    const has_from_env = envNonEmpty(env, key_env_name) != null;
+    if (!has_literal and !has_from_env) m.credential = true;
+    return m;
+}
+
+pub fn ephemeralReady(env: Env) bool {
+    const m = ephemeralMissing(env);
+    return !m.base_url and !m.model and !m.credential;
+}
+
+/// Human-readable hint for agents when neither file nor ephemeral config works.
+pub fn noConfigHint(arena: Allocator, env: Env) ![]const u8 {
+    if (ephemeralIntent(env)) {
+        const m = ephemeralMissing(env);
+        var list = std.ArrayList(u8).empty;
+        try list.appendSlice(arena, "ephemeral config incomplete; set:");
+        if (m.base_url) try list.appendSlice(arena, " IMAGINE_BASE_URL");
+        if (m.model) try list.appendSlice(arena, " IMAGINE_MODEL");
+        if (m.credential) try list.appendSlice(arena, " AZURE_OPENAI_APIKEY|IMAGINE_API_KEY|IMAGINE_API_KEY_ENV");
+        try list.appendSlice(arena, "\nor run 'imagine config init' for a multi-model config file\n");
+        return list.toOwnedSlice(arena);
+    }
+    return arena.dupe(u8,
+        \\no config file found and ephemeral env incomplete
+        \\  file: run 'imagine config init'  (or set IMAGINE_CONFIG / --config)
+        \\  ephemeral: set IMAGINE_BASE_URL + IMAGINE_MODEL + AZURE_OPENAI_APIKEY
+        \\             (or IMAGINE_API_KEY / IMAGINE_API_KEY_ENV)
+        \\
+    );
+}
+
+fn parseEnvU32(raw: []const u8) ?u32 {
+    return std.fmt.parseInt(u32, raw, 10) catch null;
+}
+
+/// Synthesize a single-model config from environment variables.
+pub fn loadEphemeral(gpa: Allocator, env: Env) Error!Config {
+    const base_url = envNonEmpty(env, env_base_url) orelse return Error.EphemeralIncomplete;
+    const model_name = envNonEmpty(env, env_model) orelse return Error.EphemeralIncomplete;
+
+    const arena_ptr = try gpa.create(std.heap.ArenaAllocator);
+    errdefer gpa.destroy(arena_ptr);
+    arena_ptr.* = std.heap.ArenaAllocator.init(gpa);
+    errdefer arena_ptr.deinit();
+    const arena = arena_ptr.allocator();
+
+    const backend_str = envNonEmpty(env, env_backend) orelse "openai_image";
+    const backend = types.BackendKind.fromString(backend_str) orelse return Error.UnknownBackend;
+
+    const auth_str = envNonEmpty(env, env_auth) orelse "bearer";
+    const auth = types.AuthScheme.fromString(auth_str) orelse return Error.UnknownAuth;
+
+    var ep: types.Endpoint = .{
+        .base_url = try arena.dupe(u8, base_url),
+        .auth = auth,
+    };
+
+    const api_model_set = envNonEmpty(env, env_api_model) != null;
+    const api_model = if (envNonEmpty(env, env_api_model)) |am|
+        try arena.dupe(u8, am)
+    else
+        try arena.dupe(u8, model_name);
+
+    if (envNonEmpty(env, env_api_key)) |k| {
+        ep.api_key = try arena.dupe(u8, k);
+        ep.resolved_key = ep.api_key;
+    } else {
+        const key_env = envNonEmpty(env, env_api_key_env) orelse env_default_api_key_env;
+        ep.api_key_env = try arena.dupe(u8, key_env);
+        if (envNonEmpty(env, key_env)) |val| {
+            ep.resolved_key = try arena.dupe(u8, val);
+        } else {
+            return Error.EphemeralNoCredential;
+        }
+    }
+
+    var defaults: types.ModelDefaults = .{};
+    if (envNonEmpty(env, env_size)) |s| defaults.size = try arena.dupe(u8, s);
+    if (envNonEmpty(env, env_format)) |s| defaults.output_format = try arena.dupe(u8, s);
+    if (envNonEmpty(env, env_quality)) |s| defaults.quality = try arena.dupe(u8, s);
+    if (envNonEmpty(env, env_width)) |s| defaults.width = parseEnvU32(s) orelse return Error.BadFieldType;
+    if (envNonEmpty(env, env_height)) |s| defaults.height = parseEnvU32(s) orelse return Error.BadFieldType;
+    if (envNonEmpty(env, env_compression)) |s| defaults.output_compression = parseEnvU32(s) orelse return Error.BadFieldType;
+
+    const endpoints = try arena.alloc(types.Endpoint, 1);
+    endpoints[0] = ep;
+
+    const models = try arena.alloc(types.ModelConfig, 1);
+    models[0] = .{
+        .name = try arena.dupe(u8, model_name),
+        .backend = backend,
+        .api_model = api_model,
+        .endpoints = endpoints,
+        .defaults = defaults,
+    };
+
+    const output_dir = if (envNonEmpty(env, env_output_dir)) |d|
+        try arena.dupe(u8, d)
+    else
+        try arena.dupe(u8, "~/.imagine/outputs");
+
+    var concurrency: u32 = 0;
+    if (envNonEmpty(env, env_concurrency)) |s| {
+        concurrency = parseEnvU32(s) orelse return Error.BadFieldType;
+    }
+
+    return .{
+        .gpa = gpa,
+        .arena = arena_ptr,
+        .output_dir = output_dir,
+        .concurrency = concurrency,
+        .models = models,
+        .source = .ephemeral,
+        .ephemeral_api_model_set = api_model_set,
+    };
 }
 
 pub fn inferFormatFromPath(path: []const u8) ?Format {
@@ -763,53 +947,59 @@ pub fn renderAlloc(arena: Allocator, cfg: Config, format: Format) ![]const u8 {
     };
 }
 
-/// Built-in starter config written by `imagine config init`. The Azure endpoint
-/// reads its key from `$AZURE_API_KEY`.
+/// Built-in starter config written by `imagine config init`.
+/// Example models are illustrative — rename/add/remove freely.
+/// Default credential env: `$AZURE_OPENAI_APIKEY`.
 pub const template =
+    \\# Starter config. Edit model names, api_model, and endpoint URLs to match
+    \\# your OpenAI-compatible deployments. Run `imagine models` to list them.
     \\output_dir = "~/.imagine/outputs"
     \\concurrency = 0
     \\
-    \\[models."gpt-image-1.5"]
-    \\backend = "azure_image"
-    \\api_model = "gpt-image-1.5"
+    \\[models."MAI-Image-2.6"]
+    \\backend = "openai_image"
+    \\api_model = "MAI-Image-2.6"
     \\
-    \\[[models."gpt-image-1.5".endpoints]]
-    \\base_url = "https://your-resource.services.ai.azure.com/openai/v1/images/generations"
-    \\api_key_env = "AZURE_API_KEY"
+    \\[[models."MAI-Image-2.6".endpoints]]
+    \\base_url = "https://jettai2.services.ai.azure.com/mai/v1/images/generations"
+    \\api_key_env = "AZURE_OPENAI_APIKEY"
     \\auth = "bearer"
     \\
-    \\[models."gpt-image-1.5".defaults]
+    \\[models."MAI-Image-2.6".defaults]
     \\size = "1024x1024"
     \\output_format = "png"
     \\output_compression = 100
     \\quality = "high"
     \\
-    \\[models."gpt-image-2"]
-    \\backend = "azure_image"
-    \\api_model = "gpt-image-2"
+    \\[models."MAI-Image-2.5"]
+    \\backend = "openai_image"
+    \\api_model = "MAI-Image-2.5"
     \\
-    \\[[models."gpt-image-2".endpoints]]
-    \\base_url = "https://your-resource.services.ai.azure.com/openai/v1/images/generations"
-    \\api_key_env = "AZURE_API_KEY"
+    \\[[models."MAI-Image-2.5".endpoints]]
+    \\base_url = "https://jettai2.services.ai.azure.com/mai/v1/images/generations"
+    \\api_key_env = "AZURE_OPENAI_APIKEY"
     \\auth = "bearer"
     \\
-    \\[models."gpt-image-2".defaults]
+    \\[models."MAI-Image-2.5".defaults]
     \\size = "1024x1024"
     \\output_format = "png"
     \\output_compression = 100
+    \\quality = "high"
     \\
-    \\[models."FLUX.2-pro"]
-    \\backend = "azure_flux"
-    \\api_model = "FLUX.2-pro"
+    \\[models."MAI-Image-2.6-Flash"]
+    \\backend = "openai_image"
+    \\api_model = "MAI-Image-2.6-Flash"
     \\
-    \\[[models."FLUX.2-pro".endpoints]]
-    \\base_url = "https://your-resource.services.ai.azure.com/providers/blackforestlabs/v1/flux-2-pro?api-version=preview"
-    \\api_key_env = "AZURE_API_KEY"
+    \\[[models."MAI-Image-2.6-Flash".endpoints]]
+    \\base_url = "https://jettai2.services.ai.azure.com/mai/v1/images/generations"
+    \\api_key_env = "AZURE_OPENAI_APIKEY"
     \\auth = "bearer"
     \\
-    \\[models."FLUX.2-pro".defaults]
-    \\width = 1024
-    \\height = 1024
+    \\[models."MAI-Image-2.6-Flash".defaults]
+    \\size = "1024x1024"
+    \\output_format = "png"
+    \\output_compression = 100
+    \\quality = "high"
     \\
 ;
 
@@ -818,13 +1008,13 @@ pub const json_template =
     \\  "output_dir": "~/.imagine/outputs",
     \\  "concurrency": 0,
     \\  "models": {
-    \\    "gpt-image-1.5": {
-    \\      "backend": "azure_image",
-    \\      "api_model": "gpt-image-1.5",
+    \\    "MAI-Image-2.6": {
+    \\      "backend": "openai_image",
+    \\      "api_model": "MAI-Image-2.6",
     \\      "endpoints": [
     \\        {
-    \\          "base_url": "https://your-resource.services.ai.azure.com/openai/v1/images/generations",
-    \\          "api_key_env": "AZURE_API_KEY",
+    \\          "base_url": "https://jettai2.services.ai.azure.com/mai/v1/images/generations",
+    \\          "api_key_env": "AZURE_OPENAI_APIKEY",
     \\          "auth": "bearer"
     \\        }
     \\      ],
@@ -835,35 +1025,38 @@ pub const json_template =
     \\        "quality": "high"
     \\      }
     \\    },
-    \\    "gpt-image-2": {
-    \\      "backend": "azure_image",
-    \\      "api_model": "gpt-image-2",
+    \\    "MAI-Image-2.5": {
+    \\      "backend": "openai_image",
+    \\      "api_model": "MAI-Image-2.5",
     \\      "endpoints": [
     \\        {
-    \\          "base_url": "https://your-resource.services.ai.azure.com/openai/v1/images/generations",
-    \\          "api_key_env": "AZURE_API_KEY",
+    \\          "base_url": "https://jettai2.services.ai.azure.com/mai/v1/images/generations",
+    \\          "api_key_env": "AZURE_OPENAI_APIKEY",
     \\          "auth": "bearer"
     \\        }
     \\      ],
     \\      "defaults": {
     \\        "size": "1024x1024",
     \\        "output_format": "png",
-    \\        "output_compression": 100
+    \\        "output_compression": 100,
+    \\        "quality": "high"
     \\      }
     \\    },
-    \\    "FLUX.2-pro": {
-    \\      "backend": "azure_flux",
-    \\      "api_model": "FLUX.2-pro",
+    \\    "MAI-Image-2.6-Flash": {
+    \\      "backend": "openai_image",
+    \\      "api_model": "MAI-Image-2.6-Flash",
     \\      "endpoints": [
     \\        {
-    \\          "base_url": "https://your-resource.services.ai.azure.com/providers/blackforestlabs/v1/flux-2-pro?api-version=preview",
-    \\          "api_key_env": "AZURE_API_KEY",
+    \\          "base_url": "https://jettai2.services.ai.azure.com/mai/v1/images/generations",
+    \\          "api_key_env": "AZURE_OPENAI_APIKEY",
     \\          "auth": "bearer"
     \\        }
     \\      ],
     \\      "defaults": {
-    \\        "width": 1024,
-    \\        "height": 1024
+    \\        "size": "1024x1024",
+    \\        "output_format": "png",
+    \\        "output_compression": 100,
+    \\        "quality": "high"
     \\      }
     \\    }
     \\  }
@@ -888,22 +1081,22 @@ test "loadFromBytes parses models, endpoints and defaults" {
     const a = std.testing.allocator;
     var te = TestEnv{ .map = std.StringHashMap([]const u8).init(a) };
     defer te.map.deinit();
-    try te.map.put("AZURE_API_KEY", "secret-123");
+    try te.map.put("AZURE_OPENAI_APIKEY", "secret-123");
 
     var cfg = try loadFromBytes(a, template, te.env());
     defer cfg.deinit();
 
     try std.testing.expectEqual(@as(usize, 3), cfg.models.len);
-    const m = cfg.findModel("gpt-image-1.5").?;
-    try std.testing.expectEqual(types.BackendKind.azure_image, m.backend);
-    try std.testing.expectEqualStrings("gpt-image-1.5", m.api_model);
+    const m = cfg.findModel("MAI-Image-2.6").?;
+    try std.testing.expectEqual(types.BackendKind.openai_image, m.backend);
+    try std.testing.expectEqualStrings("MAI-Image-2.6", m.api_model);
     try std.testing.expectEqual(@as(usize, 1), m.endpoints.len);
     try std.testing.expectEqualStrings("secret-123", m.endpoints[0].resolved_key.?);
     try std.testing.expectEqualStrings("1024x1024", m.defaults.size.?);
 
-    const flux = cfg.findModel("FLUX.2-pro").?;
-    try std.testing.expectEqual(types.BackendKind.azure_flux, flux.backend);
-    try std.testing.expectEqual(@as(u32, 1024), flux.defaults.width.?);
+    const flash = cfg.findModel("MAI-Image-2.6-Flash").?;
+    try std.testing.expectEqual(types.BackendKind.openai_image, flash.backend);
+    try std.testing.expectEqualStrings("MAI-Image-2.6-Flash", flash.api_model);
 }
 
 test "loadJsonFromBytes keeps legacy config support" {
@@ -912,7 +1105,7 @@ test "loadJsonFromBytes keeps legacy config support" {
     defer cfg.deinit();
 
     try std.testing.expectEqual(@as(usize, 3), cfg.models.len);
-    try std.testing.expectEqualStrings("gpt-image-2", cfg.findModel("gpt-image-2").?.api_model);
+    try std.testing.expectEqualStrings("MAI-Image-2.5", cfg.findModel("MAI-Image-2.5").?.api_model);
 }
 
 test "render TOML can be parsed again" {
@@ -927,7 +1120,7 @@ test "render TOML can be parsed again" {
     var cfg2 = try loadFromBytes(a, toml, Env.empty());
     defer cfg2.deinit();
     try std.testing.expectEqual(@as(usize, 3), cfg2.models.len);
-    try std.testing.expectEqualStrings("1024x1024", cfg2.findModel("gpt-image-1.5").?.defaults.size.?);
+    try std.testing.expectEqualStrings("1024x1024", cfg2.findModel("MAI-Image-2.6").?.defaults.size.?);
 }
 
 test "resolvePath precedence" {
@@ -949,4 +1142,60 @@ test "resolvePath precedence" {
 test "missing models errors" {
     const a = std.testing.allocator;
     try std.testing.expectError(Error.MissingModels, loadFromBytes(a, "{}", Env.empty()));
+}
+
+test "loadEphemeral synthesizes single openai_image model" {
+    const a = std.testing.allocator;
+    var te = TestEnv{ .map = std.StringHashMap([]const u8).init(a) };
+    defer te.map.deinit();
+    try te.map.put(env_base_url, "https://example.com/v1/images/generations");
+    try te.map.put(env_model, "MAI-Image-2.6-Flash");
+    try te.map.put(env_default_api_key_env, "secret-key");
+    try te.map.put(env_size, "1024x1024");
+
+    var cfg = try loadEphemeral(a, te.env());
+    defer cfg.deinit();
+
+    try std.testing.expectEqual(Source.ephemeral, cfg.source);
+    try std.testing.expectEqual(@as(usize, 1), cfg.models.len);
+    try std.testing.expectEqualStrings("MAI-Image-2.6-Flash", cfg.models[0].name);
+    try std.testing.expectEqualStrings("MAI-Image-2.6-Flash", cfg.models[0].api_model);
+    try std.testing.expectEqual(types.BackendKind.openai_image, cfg.models[0].backend);
+    try std.testing.expectEqualStrings("https://example.com/v1/images/generations", cfg.models[0].endpoints[0].base_url);
+    try std.testing.expectEqualStrings("secret-key", cfg.models[0].endpoints[0].resolved_key.?);
+    try std.testing.expectEqualStrings(env_default_api_key_env, cfg.models[0].endpoints[0].api_key_env.?);
+    try std.testing.expectEqualStrings("1024x1024", cfg.models[0].defaults.size.?);
+    try std.testing.expect(ephemeralReady(te.env()));
+}
+
+test "loadEphemeral respects IMAGINE_API_KEY and IMAGINE_API_MODEL" {
+    const a = std.testing.allocator;
+    var te = TestEnv{ .map = std.StringHashMap([]const u8).init(a) };
+    defer te.map.deinit();
+    try te.map.put(env_base_url, "https://x/v1");
+    try te.map.put(env_model, "logical");
+    try te.map.put(env_api_model, "deployment-id");
+    try te.map.put(env_api_key, "inline-secret");
+    try te.map.put(env_backend, "azure_image"); // legacy alias
+    try te.map.put(env_auth, "api-key");
+
+    var cfg = try loadEphemeral(a, te.env());
+    defer cfg.deinit();
+
+    try std.testing.expect(cfg.ephemeral_api_model_set);
+    try std.testing.expectEqualStrings("deployment-id", cfg.models[0].api_model);
+    try std.testing.expectEqualStrings("inline-secret", cfg.models[0].endpoints[0].resolved_key.?);
+    try std.testing.expectEqual(types.AuthScheme.api_key, cfg.models[0].endpoints[0].auth);
+    try std.testing.expectEqual(types.BackendKind.openai_image, cfg.models[0].backend);
+}
+
+test "ephemeralIncomplete when base url missing" {
+    const a = std.testing.allocator;
+    var te = TestEnv{ .map = std.StringHashMap([]const u8).init(a) };
+    defer te.map.deinit();
+    try te.map.put(env_model, "m");
+    try te.map.put(env_default_api_key_env, "k");
+    try std.testing.expect(ephemeralIntent(te.env()));
+    try std.testing.expect(!ephemeralReady(te.env()));
+    try std.testing.expectError(Error.EphemeralIncomplete, loadEphemeral(a, te.env()));
 }

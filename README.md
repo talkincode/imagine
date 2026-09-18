@@ -10,17 +10,18 @@
 ---
 
 A universal **image-generation CLI for AI agents**. Unified front-end
-parameters, routed to different backends by model name. One model can have
-multiple endpoints (URL + key) for concurrent scheduling. Single static Zig
-binary — no `curl`/`jq`/`base64` dependencies.
+parameters, routed to different backends by **configured** model name. One
+model can have multiple endpoints (URL + key) for concurrent scheduling.
+Single static Zig binary — no `curl`/`jq`/`base64` dependencies.
 
-- **Unified params** → route to a backend by `-m <model>`.
-- **Multi-backend, extensible** — add a model by adding one body-builder + one switch arm.
+- **Unified params** → route to a backend by `-m <model>` (names from config).
+- **OpenAI-compatible by default** — `openai_image` speaks `/v1/images/generations`.
+- **Dynamic models** — add/rename/remove models in config; discover with `imagine models`.
 - **Concurrent scheduling** — multiple endpoints per model are load-balanced.
 - **Agent-friendly** — `--json` machine output, `--dry-run`, meaningful exit codes.
 
-First backends: Azure `gpt-image-1.5`, `gpt-image-2` (image generations) and
-`FLUX.2-pro` (Black Forest Labs).
+Also supports Azure FLUX via `azure_flux` (width/height body). Starter config
+ships example model entries you can edit freely.
 
 
 ## Install
@@ -45,7 +46,7 @@ curl -fsSL https://raw.githubusercontent.com/talkincode/imagine/main/install.sh 
 
 This installs the `imagine` binary to `~/.local/bin` and the agent skill to
 `~/.agents/skills/imagine`. Override with `IMAGINE_BIN_DIR`, `IMAGINE_AGENTS_DIR`,
-or pin a release with `IMAGINE_VERSION=v0.1.3`.
+or pin a release with `IMAGINE_VERSION=v0.2.0`.
 
 **Windows:** download `imagine-windows-x86_64.exe` (or `-aarch64`) from the
 [latest release](https://github.com/talkincode/imagine/releases/latest) and put
@@ -68,13 +69,19 @@ Building from source requires **Zig ≥ 0.16.0** (`brew install zig` or
 ## Quick start
 
 ```bash
-imagine config init                 # write ~/.imagine/config.toml (3 Azure models)
-export AZURE_API_KEY="your-key"     # or edit the config file
-imagine models                      # check which models are ready
+imagine config init                      # write ~/.imagine/config.toml (example models)
+export AZURE_OPENAI_APIKEY="your-key"    # or edit api_key_env / api_key in config
+imagine models                           # list configured models and readiness (source=file|ephemeral)
 
-imagine generate -m gpt-image-1.5 -p "A photograph of a red fox in an autumn forest" -o fox.png
-imagine generate -m FLUX.2-pro    -p "a city at dusk" --width 1024 --height 1024 -o city.png
-imagine generate -m gpt-image-2   -p "logo concept"   -n 4 -o logo.png -c 4
+# Use a model name printed by `imagine models` (not a fixed name from docs):
+imagine generate -m <model> -p "A photograph of a red fox in an autumn forest" -o fox.png
+imagine generate -m <model> -p "a city at dusk" --width 1024 --height 1024 -o city.png
+imagine generate -m <model> -p "logo concept" -n 4 -o logo.png -c 4
+
+# No config file — ephemeral env (single model; -m optional):
+IMAGINE_BASE_URL="https://host/.../images/generations" \
+IMAGINE_MODEL="MAI-Image-2.6-Flash" AZURE_OPENAI_APIKEY="..." \
+  imagine generate -p "a fox" -o fox.png
 ```
 
 ## Commands
@@ -99,11 +106,11 @@ imagine version | help
 | `-p, --prompt <text>` | Prompt (**required**; or positional) |
 | `-o, --output <path>` | Output file (single) or stem (multiple) |
 | `-n, --n <count>` | Number of images (default 1) |
-| `-s, --size <WxH>` | Size for gpt-image models (see [Model sizes](#model-sizes)) |
-| `--width / --height <px>` | Dimensions for FLUX models (use instead of `--size`) |
-| `--format <fmt>` | `png` / `jpeg` (gpt-image `output_format`) |
-| `--compression <0-100>` | Output compression (gpt-image) |
-| `--quality <q>` | `low` / `medium` / `high` / `auto` (gpt-image) |
+| `-s, --size <WxH>` | Size for `openai_image` backends (provider-specific) |
+| `--width / --height <px>` | Dimensions for `azure_flux` (also derives size for `openai_image`) |
+| `--format <fmt>` | `png` / `jpeg` (`openai_image` `output_format`) |
+| `--compression <0-100>` | Output compression (`openai_image`) |
+| `--quality <q>` | `low` / `medium` / `high` / `auto` (`openai_image`) |
 | `--seed <int>` | Seed (where supported) |
 | `-c, --concurrency <n>` | Parallel requests (default: endpoint count) |
 | `--config <path>` | Use a specific config file |
@@ -169,29 +176,29 @@ zig build -Dsvg-overlay=true -Dresvg-include=/path/to/include -Dresvg-lib=/path/
 
 ### Model sizes
 
-Verified against the live Azure endpoints:
+Size limits are **provider- and deployment-specific**, not fixed in imagine.
+Put preferred sizes in each model's `defaults`, discover models with
+`imagine models`, and use `--dry-run` or `--json` `errors[]` when debugging.
 
-| Model | Size constraints |
-|-------|------------------|
-| `gpt-image-1.5` | `--size` ∈ `1024x1024`, `1536x1024` (landscape), `1024x1536` (portrait), `auto` |
-| `gpt-image-2` | `--size` = any `WxH` with both sides a multiple of **16**, longest edge ≤ **3840** (plus a minimum pixel budget) |
-| `FLUX.2-pro` | `--width`/`--height` each ≥ **64**, with `width × height ≤ 4 MP` (≤ `2048x2048`); no divisibility requirement |
-
-Unsupported sizes return a clear API error (e.g. `Supported sizes are 1024x1024, 1024x1536, 1536x1024, and auto.`).
+| Backend | Typical params |
+|---------|----------------|
+| `openai_image` | `--size` (e.g. `1024x1024`); optional `--format` / `--quality` |
+| `azure_flux` | `--width` / `--height` (and optional `--seed`) |
 
 ### batch manifest
 
 ```json
 {
   "jobs": [
-    { "model": "gpt-image-1.5", "prompt": "a fox",  "output": "out/fox.png" },
-    { "model": "FLUX.2-pro",    "prompt": "a city", "output": "out/city.png", "width": 1024, "height": 1024, "n": 2 },
-    { "model": "gpt-image-2",   "prompt": "a tree", "output": "out/tree.png", "size": "512x512" }
+    { "model": "<model-a>", "prompt": "a fox",  "output": "out/fox.png" },
+    { "model": "<model-b>", "prompt": "a city", "output": "out/city.png", "width": 1024, "height": 1024, "n": 2 },
+    { "model": "<model-c>", "prompt": "a tree", "output": "out/tree.png", "size": "512x512" }
   ]
 }
 ```
 
 Per-job keys: `model, prompt, output, size, width, height, n, format, compression, quality, seed`.
+Use model names from `imagine models`.
 
 ## Configuration
 
@@ -204,23 +211,24 @@ A ready-to-edit sample lives at [`config.example.toml`](config.example.toml)
 or run `imagine config init` to write the built-in starter:
 
 ```bash
-cp config.example.toml ~/.imagine/config.toml   # then edit URLs/keys
+cp config.example.toml ~/.imagine/config.toml   # then edit URLs/keys/model names
 ```
 
 ```toml
 output_dir = "~/.imagine/outputs"
 concurrency = 0 # 0 = auto (endpoint count)
 
-[models."gpt-image-1.5"]
-backend = "azure_image" # azure_image | azure_flux
-api_model = "gpt-image-1.5"
+# Table key = logical name for -m; rename freely.
+[models."my-image"]
+backend = "openai_image" # openai_image | azure_flux  (azure_image = legacy alias)
+api_model = "deployment-or-model-id"
 
-[[models."gpt-image-1.5".endpoints]]
+[[models."my-image".endpoints]]
 base_url = "https://<resource>.services.ai.azure.com/openai/v1/images/generations"
-api_key_env = "AZURE_API_KEY" # or api_key = "literal"
+api_key_env = "AZURE_OPENAI_APIKEY" # or api_key = "literal"
 auth = "bearer" # bearer | api-key
 
-[models."gpt-image-1.5".defaults]
+[models."my-image".defaults]
 size = "1024x1024"
 output_format = "png"
 output_compression = 100
@@ -239,7 +247,7 @@ imagine config convert --config ~/.imagine/config.json --to toml -o ~/.imagine/c
 ### `--json` result
 
 ```json
-{ "ok": true, "model": "gpt-image-1.5", "backend": "azure_image",
+{ "ok": true, "model": "my-image", "backend": "openai_image",
   "requested": 1, "succeeded": 1, "failed": 0,
   "images": [ { "path": "fox.png", "bytes": 12345 } ], "errors": [] }
 ```
@@ -249,7 +257,7 @@ imagine config convert --config ~/.imagine/config.json --to toml -o ~/.imagine/c
 ```bash
 make build      # zig build -Doptimize=ReleaseFast -Dsvg-overlay=true
 make test       # zig build test -Dsvg-overlay=true
-make run ARGS="generate -m gpt-image-1.5 -p 'a fox' --dry-run"
+make run ARGS="generate -m <model> -p 'a fox' --dry-run"
 make build-core # build without optional svg/text render support
 make test-svg
 make build RESVG_LIB=/path/to/lib

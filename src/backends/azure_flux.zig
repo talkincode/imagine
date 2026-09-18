@@ -1,8 +1,8 @@
-//! Black Forest Labs FLUX models on Azure (`FLUX.2-pro`).
+//! Black Forest Labs FLUX models on Azure.
 //!
-//! Endpoint: POST .../providers/blackforestlabs/v1/flux-2-pro?api-version=preview
+//! Endpoint shape is provider-specific (not OpenAI images/generations).
 //! Body uses integer `width`/`height` (not a size string) plus an optional
-//! `seed`. Only request-body construction lives here.
+//! `seed`. Logical model name / `api_model` come from config.
 
 const std = @import("std");
 const types = @import("../types.zig");

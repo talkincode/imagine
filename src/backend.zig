@@ -10,7 +10,7 @@ const types = @import("types.zig");
 const http = @import("http.zig");
 const util = @import("util.zig");
 
-const azure_image = @import("backends/azure_image.zig");
+const openai_image = @import("backends/openai_image.zig");
 const azure_flux = @import("backends/azure_flux.zig");
 
 const user_agent = "imagine/" ++ @import("version.zig").string;
@@ -18,7 +18,7 @@ const user_agent = "imagine/" ++ @import("version.zig").string;
 /// Construct the provider request body for a model's backend.
 pub fn buildBody(kind: types.BackendKind, allocator: std.mem.Allocator, req: types.ImageRequest) ![]u8 {
     return switch (kind) {
-        .azure_image => azure_image.buildBody(allocator, req),
+        .openai_image => openai_image.buildBody(allocator, req),
         .azure_flux => azure_flux.buildBody(allocator, req),
     };
 }

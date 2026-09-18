@@ -134,16 +134,16 @@ pub const usage =
     \\  help            Show this help
     \\
     \\GENERATE OPTIONS:
-    \\  -m, --model <name>        Model to route to (required)
+    \\  -m, --model <name>        Model to route to (optional if only one model)
     \\  -p, --prompt <text>       Text prompt (required; or pass as positional)
     \\  -o, --output <path>       Output file (single) or stem (multiple)
     \\  -n, --n <count>           Number of images (default 1)
-    \\  -s, --size <WxH>          Size for gpt-image models (see MODEL SIZES)
-    \\      --width <px>          Width for FLUX models (use instead of --size)
-    \\      --height <px>         Height for FLUX models
-    \\      --format <fmt>        png | jpeg   (gpt-image output_format)
-    \\      --compression <0-100> Output compression (gpt-image)
-    \\      --quality <q>         low | medium | high | auto   (gpt-image)
+    \\  -s, --size <WxH>          Size string for openai_image backends
+    \\      --width <px>          Width (azure_flux; also derives size for openai_image)
+    \\      --height <px>         Height (azure_flux; also derives size for openai_image)
+    \\      --format <fmt>        png | jpeg   (openai_image output_format)
+    \\      --compression <0-100> Output compression (openai_image)
+    \\      --quality <q>         low | medium | high | auto   (openai_image)
     \\      --seed <int>          Seed (where supported)
     \\  -c, --concurrency <num>   Parallel requests (default: endpoint count)
     \\      --config <path>       Use a specific config file
@@ -187,24 +187,37 @@ pub const usage =
     \\      --opacity <0-1>       Layer opacity (default 1)
     \\      --blend <mode>        normal | multiply | screen | overlay | darken | lighten
     \\
-    \\MODEL SIZES (Azure):
-    \\  gpt-image-1.5   1024x1024, 1536x1024, 1024x1536, auto
-    \\  gpt-image-2     any WxH, both sides multiple of 16, longest edge <= 3840
-    \\  FLUX.2-pro      --width/--height each >= 64; width*height <= 2048x2048 (4 MP)
+    \\MODELS:
+    \\  Logical model names come from ~/.imagine/config.toml (dynamic), or from
+    \\  ephemeral env when no config file exists. Run `imagine models`.
+    \\  backends: openai_image (OpenAI-compatible /v1/images/generations)
+    \\            azure_flux    (Azure FLUX; uses --width/--height)
+    \\  Size limits are provider-specific; use model defaults in config or --dry-run.
     \\
     \\ENVIRONMENT:
     \\  IMAGINE_CONFIG            Override config path (default ~/.imagine/config.toml)
+    \\  AZURE_OPENAI_APIKEY       Default credential env (file starter + ephemeral)
+    \\  IMAGINE_BASE_URL          Ephemeral: images endpoint URL (required if no file)
+    \\  IMAGINE_MODEL             Ephemeral: logical model name (required if no file)
+    \\  IMAGINE_API_MODEL         Ephemeral: api model field (default: IMAGINE_MODEL)
+    \\  IMAGINE_BACKEND           Ephemeral: openai_image | azure_flux (default openai_image)
+    \\  IMAGINE_AUTH              Ephemeral: bearer | api-key (default bearer)
+    \\  IMAGINE_API_KEY           Ephemeral: inline API key (overrides env key)
+    \\  IMAGINE_API_KEY_ENV       Ephemeral: env var name for key (default AZURE_OPENAI_APIKEY)
+    \\  IMAGINE_SIZE/WIDTH/...    Ephemeral model defaults
     \\
     \\EXAMPLES:
-    \\  imagine generate -m gpt-image-1.5 -p "a red fox in autumn" -o fox.png
-    \\  imagine generate -m FLUX.2-pro -p "a city at dusk" --width 1024 --height 1024
-    \\  imagine generate -m gpt-image-2 -p "logo" -n 4 -o logo.png -c 4
+    \\  imagine models --json
+    \\  imagine generate -m <model> -p "a red fox in autumn" -o fox.png
+    \\  # no config file — ephemeral env:
+    \\  IMAGINE_BASE_URL=https://host/v1/images/generations \\
+    \\  IMAGINE_MODEL=MAI-Image-2.6-Flash AZURE_OPENAI_APIKEY=... \\
+    \\    imagine generate -p "a fox" -o fox.png
     \\  imagine batch jobs.json
     \\  imagine svg render --input badge.svg -o badge.png --width 256
     \\  imagine text render --text "SALE\n50% OFF" -o copy.png --width 900 --font "PingFang SC" --size 72 --align center
     \\  imagine png compose --base photo.png --layer badge.png,x=24,y=24,blend=normal -o composed.png
     \\  imagine compose --base photo.png --svg badge.svg -o composed.png --x 24 --y 24 --width 256
-    \\  imagine models --json
     \\  imagine config convert --config ~/.imagine/config.json --to toml -o ~/.imagine/config.toml
     \\
 ;
@@ -336,7 +349,7 @@ fn parseGenerate(arena: std.mem.Allocator, args: []const []const u8) !Parsed {
     }
 
     if (g.prompt == null) g.prompt = positional;
-    if (g.model == null) return .{ .err = try arena.dupe(u8, "missing required option: --model") };
+    // --model is optional when exactly one model is configured (validated in main).
     if (g.prompt == null) return .{ .err = try arena.dupe(u8, "missing required option: --prompt") };
     if (g.n == 0) return .{ .err = try arena.dupe(u8, "--n must be >= 1") };
 
@@ -629,11 +642,13 @@ test "parse generate equals form and positional prompt" {
     try std.testing.expectEqualStrings("a cat", g.prompt.?);
 }
 
-test "missing model errors" {
+test "missing model is allowed at parse (resolved in main)" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const p = try parseArgs(arena.allocator(), &.{ "generate", "-p", "x" });
-    try std.testing.expect(p == .err);
+    try std.testing.expect(p == .command);
+    try std.testing.expect(p.command.generate.model == null);
+    try std.testing.expectEqualStrings("x", p.command.generate.prompt.?);
 }
 
 test "help and version" {

@@ -1,68 +1,58 @@
 # Global defaults. output_dir is used when --output is omitted; concurrency = 0
 # means auto-select based on the selected model's endpoint count.
+#
+# Model names are dynamic: the table key under [models."..."] is what you pass
+# to `-m` / `"model"` in batch jobs. Prefer `imagine models` to discover them.
 output_dir = "~/.imagine/outputs"
 concurrency = 0
 
-# Model group. The table key is the logical name used by --model; backend selects
-# the request builder, and api_model is the model string sent to the provider API.
-[models."gpt-image-1.5"]
-backend = "azure_image"
-api_model = "gpt-image-1.5"
+[models."MAI-Image-2.6"]
+backend = "openai_image"
+api_model = "MAI-Image-2.6"
 
-# Endpoint group. Add more endpoint tables under the same model to distribute
-# concurrent requests across regions, resources, or API keys. Prefer api_key_env
-# over api_key so secrets stay outside the config file.
-[[models."gpt-image-1.5".endpoints]]
-base_url = "https://your-resource.services.ai.azure.com/openai/v1/images/generations"
-api_key_env = "AZURE_API_KEY"
+[[models."MAI-Image-2.6".endpoints]]
+base_url = "https://jettai2.services.ai.azure.com/mai/v1/images/generations"
+api_key_env = "AZURE_OPENAI_APIKEY"
 auth = "bearer"
 
-# Additional endpoint for the same logical model; generation fans out across
-# configured endpoints when concurrency allows it.
-[[models."gpt-image-1.5".endpoints]]
-base_url = "https://your-resource-2.services.ai.azure.com/openai/v1/images/generations"
-api_key_env = "AZURE_API_KEY_2"
+# Second endpoint example for concurrent fan-out (optional).
+[[models."MAI-Image-2.6".endpoints]]
+base_url = "https://jettai2.services.ai.azure.com/mai/v1/images/generations"
+api_key_env = "AZURE_OPENAI_APIKEY_2"
 auth = "bearer"
 
-# Model defaults fill in omitted CLI options. CLI flags always take precedence.
-[models."gpt-image-1.5".defaults]
+[models."MAI-Image-2.6".defaults]
 size = "1024x1024"
 output_format = "png"
 output_compression = 100
 quality = "high"
 
-# Another Azure image-generation model using the same backend with a different
-# provider model name.
-[models."gpt-image-2"]
-backend = "azure_image"
-api_model = "gpt-image-2"
+[models."MAI-Image-2.5"]
+backend = "openai_image"
+api_model = "MAI-Image-2.5"
 
-# Single endpoint group for gpt-image-2. auth may be bearer or api-key depending
-# on how your Azure resource is configured.
-[[models."gpt-image-2".endpoints]]
-base_url = "https://your-resource.services.ai.azure.com/openai/v1/images/generations"
-api_key_env = "AZURE_API_KEY"
-auth = "api-key"
+[[models."MAI-Image-2.5".endpoints]]
+base_url = "https://jettai2.services.ai.azure.com/mai/v1/images/generations"
+api_key_env = "AZURE_OPENAI_APIKEY"
+auth = "bearer"
 
-# Defaults for gpt-image-2.
-[models."gpt-image-2".defaults]
+[models."MAI-Image-2.5".defaults]
 size = "1024x1024"
 output_format = "png"
 output_compression = 100
+quality = "high"
 
-# Azure-hosted FLUX model. This backend uses explicit width and height instead
-# of the gpt-image size string.
-[models."FLUX.2-pro"]
-backend = "azure_flux"
-api_model = "FLUX.2-pro"
+[models."MAI-Image-2.6-Flash"]
+backend = "openai_image"
+api_model = "MAI-Image-2.6-Flash"
 
-# Single endpoint group for FLUX.2-pro.
-[[models."FLUX.2-pro".endpoints]]
-base_url = "https://your-resource.services.ai.azure.com/providers/blackforestlabs/v1/flux-2-pro?api-version=preview"
-api_key_env = "AZURE_API_KEY"
+[[models."MAI-Image-2.6-Flash".endpoints]]
+base_url = "https://jettai2.services.ai.azure.com/mai/v1/images/generations"
+api_key_env = "AZURE_OPENAI_APIKEY"
 auth = "bearer"
 
-# Defaults for FLUX.2-pro.
-[models."FLUX.2-pro".defaults]
-width = 1024
-height = 1024
+[models."MAI-Image-2.6-Flash".defaults]
+size = "1024x1024"
+output_format = "png"
+output_compression = 100
+quality = "high"
