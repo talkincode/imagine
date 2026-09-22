@@ -14,6 +14,7 @@
 
 const std = @import("std");
 const types = @import("types.zig");
+const presets = @import("presets.zig");
 
 const Allocator = std.mem.Allocator;
 const Value = std.json.Value;
@@ -21,6 +22,10 @@ const Value = std.json.Value;
 pub const default_rel_path = ".imagine/config.toml";
 pub const legacy_json_rel_path = ".imagine/config.json";
 pub const env_config_path = "IMAGINE_CONFIG";
+
+/// Async (video) task defaults, overridable per config file and per CLI run.
+pub const default_poll_interval: u32 = 5;
+pub const default_task_timeout: u32 = 600;
 
 /// Ephemeral (no-file) config env vars.
 pub const env_base_url = "IMAGINE_BASE_URL";
@@ -40,6 +45,12 @@ pub const env_format = "IMAGINE_FORMAT";
 pub const env_compression = "IMAGINE_COMPRESSION";
 pub const env_quality = "IMAGINE_QUALITY";
 pub const env_steps = "IMAGINE_STEPS";
+pub const env_duration = "IMAGINE_DURATION";
+pub const env_resolution = "IMAGINE_RESOLUTION";
+pub const env_ratio = "IMAGINE_RATIO";
+pub const env_watermark = "IMAGINE_WATERMARK";
+pub const env_poll_interval = "IMAGINE_POLL_INTERVAL";
+pub const env_task_timeout = "IMAGINE_TASK_TIMEOUT";
 
 pub const Format = enum {
     json,
@@ -60,13 +71,19 @@ pub const Format = enum {
 };
 
 pub const Source = enum {
+    /// A config file (`--config` / `$IMAGINE_CONFIG` / `~/.imagine/config.toml`).
     file,
+    /// Synthesized from `IMAGINE_*` environment variables (no config file).
     ephemeral,
+    /// No config file and no ephemeral env: only the built-in presets, which is
+    /// enough to run a first-party provider with just its API key set.
+    preset,
 
     pub fn toString(self: Source) []const u8 {
         return switch (self) {
             .file => "file",
             .ephemeral => "ephemeral",
+            .preset => "preset",
         };
     }
 };
@@ -119,7 +136,15 @@ pub const Config = struct {
     output_dir: []const u8,
     /// 0 means "auto" (derive from endpoint count).
     concurrency: u32,
+    /// Async (video) tasks: seconds between provider status polls.
+    poll_interval: u32 = default_poll_interval,
+    /// Async (video) tasks: give up on one task after this many seconds.
+    task_timeout: u32 = default_task_timeout,
     models: []types.ModelConfig,
+    /// Built-in convenience models (see `presets.zig`). Looked up by name only
+    /// when the user's own models do not define that name, so a config entry
+    /// always wins over a preset.
+    presets: []types.ModelConfig = &.{},
     /// Path the config was loaded from, if any (informational).
     source_path: ?[]const u8 = null,
     source_format: ?Format = null,
@@ -138,7 +163,38 @@ pub const Config = struct {
         }
         return null;
     }
+
+    /// A preset is only reachable when no configured model claims the name.
+    pub fn findPreset(self: *const Config, name: []const u8) ?*const types.ModelConfig {
+        if (self.findModel(name) != null) return null;
+        for (self.presets) |*m| {
+            if (std.mem.eql(u8, m.name, name)) return m;
+        }
+        return null;
+    }
 };
+
+/// Materialize `presets.catalog` into models, resolving each credential from the
+/// environment so `imagine models` can report readiness.
+fn loadPresets(arena: Allocator, env: Env) ![]types.ModelConfig {
+    const list = try arena.alloc(types.ModelConfig, presets.catalog.len);
+    for (presets.catalog, 0..) |p, i| {
+        const endpoints = try arena.alloc(types.Endpoint, 1);
+        endpoints[0] = .{
+            .base_url = try arena.dupe(u8, p.base_url),
+            .api_key_env = try arena.dupe(u8, p.api_key_env),
+            .auth = p.auth,
+        };
+        try resolveEndpointKeys(arena, env, &endpoints[0]);
+        list[i] = .{
+            .name = try arena.dupe(u8, p.name),
+            .backend = p.backend,
+            .api_model = try arena.dupe(u8, p.api_model),
+            .endpoints = endpoints,
+        };
+    }
+    return list;
+}
 
 /// Resolve the config file path. Precedence: explicit > $IMAGINE_CONFIG >
 /// $HOME/.imagine/config.toml. Returned memory is owned by `arena`.
@@ -195,6 +251,17 @@ pub fn ephemeralNeedsCredential(env: Env) bool {
     return true;
 }
 
+/// Credential env var used when `IMAGINE_API_KEY_ENV` names none: the selected
+/// backend's canonical one (`ARK_API_KEY` for the Ark backends, `GEMINI_API_KEY`
+/// for Gemini, `AZURE_OPENAI_APIKEY` otherwise). Without this, an ephemeral run
+/// against a video backend would ask for an Azure key.
+pub fn ephemeralKeyEnv(env: Env) []const u8 {
+    if (envNonEmpty(env, env_api_key_env)) |name| return name;
+    const backend_str = envNonEmpty(env, env_backend) orelse return env_default_api_key_env;
+    const backend = types.BackendKind.fromString(backend_str) orelse return env_default_api_key_env;
+    return backend.defaultKeyEnv();
+}
+
 pub fn ephemeralMissing(env: Env) EphemeralMissing {
     var m: EphemeralMissing = .{};
     if (envNonEmpty(env, env_base_url) == null) m.base_url = true;
@@ -203,8 +270,7 @@ pub fn ephemeralMissing(env: Env) EphemeralMissing {
     if (!ephemeralNeedsCredential(env)) return m;
 
     const has_literal = envNonEmpty(env, env_api_key) != null;
-    const key_env_name = envNonEmpty(env, env_api_key_env) orelse env_default_api_key_env;
-    const has_from_env = envNonEmpty(env, key_env_name) != null;
+    const has_from_env = envNonEmpty(env, ephemeralKeyEnv(env)) != null;
     if (!has_literal and !has_from_env) m.credential = true;
     return m;
 }
@@ -222,21 +288,32 @@ pub fn noConfigHint(arena: Allocator, env: Env) ![]const u8 {
         try list.appendSlice(arena, "ephemeral config incomplete; set:");
         if (m.base_url) try list.appendSlice(arena, " IMAGINE_BASE_URL");
         if (m.model) try list.appendSlice(arena, " IMAGINE_MODEL");
-        if (m.credential) try list.appendSlice(arena, " AZURE_OPENAI_APIKEY|IMAGINE_API_KEY|IMAGINE_API_KEY_ENV");
+        if (m.credential) {
+            try list.appendSlice(arena, " ");
+            try list.appendSlice(arena, ephemeralKeyEnv(env));
+            try list.appendSlice(arena, "|IMAGINE_API_KEY|IMAGINE_API_KEY_ENV");
+        }
         try list.appendSlice(arena, "\nor run 'imagine config init' for a multi-model config file\n");
         return list.toOwnedSlice(arena);
     }
     return arena.dupe(u8,
         \\no config file found and ephemeral env incomplete
         \\  file: run 'imagine config init'  (or set IMAGINE_CONFIG / --config)
-        \\  ephemeral: set IMAGINE_BASE_URL + IMAGINE_MODEL + AZURE_OPENAI_APIKEY
-        \\             (or IMAGINE_API_KEY / IMAGINE_API_KEY_ENV)
+        \\  ephemeral: set IMAGINE_BASE_URL + IMAGINE_MODEL + a credential env:
+        \\             AZURE_OPENAI_APIKEY (default), ARK_API_KEY, GEMINI_API_KEY,
+        \\             or IMAGINE_API_KEY / IMAGINE_API_KEY_ENV
         \\
     );
 }
 
 fn parseEnvU32(raw: []const u8) ?u32 {
     return std.fmt.parseInt(u32, raw, 10) catch null;
+}
+
+fn parseEnvBool(raw: []const u8) ?bool {
+    if (std.ascii.eqlIgnoreCase(raw, "true") or std.mem.eql(u8, raw, "1")) return true;
+    if (std.ascii.eqlIgnoreCase(raw, "false") or std.mem.eql(u8, raw, "0")) return false;
+    return null;
 }
 
 /// Synthesize a single-model config from environment variables.
@@ -273,7 +350,7 @@ pub fn loadEphemeral(gpa: Allocator, env: Env) Error!Config {
     } else if (auth == .none) {
         // Local server: nothing to resolve, and no auth header is sent.
     } else {
-        const key_env = envNonEmpty(env, env_api_key_env) orelse env_default_api_key_env;
+        const key_env = ephemeralKeyEnv(env);
         ep.api_key_env = try arena.dupe(u8, key_env);
         if (envNonEmpty(env, key_env)) |val| {
             ep.resolved_key = try arena.dupe(u8, val);
@@ -290,6 +367,10 @@ pub fn loadEphemeral(gpa: Allocator, env: Env) Error!Config {
     if (envNonEmpty(env, env_height)) |s| defaults.height = parseEnvU32(s) orelse return Error.BadFieldType;
     if (envNonEmpty(env, env_compression)) |s| defaults.output_compression = parseEnvU32(s) orelse return Error.BadFieldType;
     if (envNonEmpty(env, env_steps)) |s| defaults.steps = parseEnvU32(s) orelse return Error.BadFieldType;
+    if (envNonEmpty(env, env_duration)) |s| defaults.duration = parseEnvU32(s) orelse return Error.BadFieldType;
+    if (envNonEmpty(env, env_resolution)) |s| defaults.resolution = try arena.dupe(u8, s);
+    if (envNonEmpty(env, env_ratio)) |s| defaults.ratio = try arena.dupe(u8, s);
+    if (envNonEmpty(env, env_watermark)) |s| defaults.watermark = parseEnvBool(s) orelse return Error.BadFieldType;
 
     const endpoints = try arena.alloc(types.Endpoint, 1);
     endpoints[0] = ep;
@@ -312,15 +393,47 @@ pub fn loadEphemeral(gpa: Allocator, env: Env) Error!Config {
     if (envNonEmpty(env, env_concurrency)) |s| {
         concurrency = parseEnvU32(s) orelse return Error.BadFieldType;
     }
+    var poll_interval: u32 = default_poll_interval;
+    if (envNonEmpty(env, env_poll_interval)) |s| {
+        poll_interval = parseEnvU32(s) orelse return Error.BadFieldType;
+    }
+    var task_timeout: u32 = default_task_timeout;
+    if (envNonEmpty(env, env_task_timeout)) |s| {
+        task_timeout = parseEnvU32(s) orelse return Error.BadFieldType;
+    }
 
     return .{
         .gpa = gpa,
         .arena = arena_ptr,
         .output_dir = output_dir,
         .concurrency = concurrency,
+        .poll_interval = poll_interval,
+        .task_timeout = task_timeout,
         .models = models,
+        .presets = try loadPresets(arena, env),
         .source = .ephemeral,
         .ephemeral_api_model_set = api_model_set,
+    };
+}
+
+/// A config with no user models at all: the built-in presets and nothing else.
+/// Reached when no config file and no ephemeral env exist, which is what makes
+/// `ARK_API_KEY=… imagine generate -m <preset>` work out of the box.
+pub fn loadPresetsOnly(gpa: Allocator, env: Env) Error!Config {
+    const arena_ptr = try gpa.create(std.heap.ArenaAllocator);
+    errdefer gpa.destroy(arena_ptr);
+    arena_ptr.* = std.heap.ArenaAllocator.init(gpa);
+    errdefer arena_ptr.deinit();
+    const arena = arena_ptr.allocator();
+
+    return .{
+        .gpa = gpa,
+        .arena = arena_ptr,
+        .output_dir = try arena.dupe(u8, "~/.imagine/outputs"),
+        .concurrency = 0,
+        .models = &.{},
+        .presets = try loadPresets(arena, env),
+        .source = .preset,
     };
 }
 
@@ -361,10 +474,16 @@ fn parseDefaults(arena: Allocator, obj: *const std.json.ObjectMap) !types.ModelD
     if (getStr(obj, "size")) |s| d.size = try arena.dupe(u8, s);
     if (getStr(obj, "output_format")) |s| d.output_format = try arena.dupe(u8, s);
     if (getStr(obj, "quality")) |s| d.quality = try arena.dupe(u8, s);
+    if (getStr(obj, "resolution")) |s| d.resolution = try arena.dupe(u8, s);
+    if (getStr(obj, "ratio")) |s| d.ratio = try arena.dupe(u8, s);
     d.width = try getU32(obj, "width");
     d.height = try getU32(obj, "height");
     d.output_compression = try getU32(obj, "output_compression");
     d.steps = try getU32(obj, "steps");
+    d.duration = try getU32(obj, "duration");
+    if (obj.get("watermark")) |wv| {
+        if (wv == .bool) d.watermark = wv.bool;
+    }
     return d;
 }
 
@@ -444,6 +563,7 @@ const ModelBuilder = struct {
 const TomlScalar = union(enum) {
     string: []const u8,
     integer: i64,
+    boolean: bool,
 };
 
 const TomlSection = union(enum) {
@@ -579,6 +699,8 @@ fn parseTomlScalar(arena: Allocator, raw: []const u8) Error!TomlScalar {
     const s = std.mem.trim(u8, raw, " \t\r\n");
     if (s.len == 0) return Error.InvalidToml;
     if (s[0] == '"' or s[0] == '\'') return .{ .string = try parseTomlQuotedString(arena, s) };
+    if (std.mem.eql(u8, s, "true")) return .{ .boolean = true };
+    if (std.mem.eql(u8, s, "false")) return .{ .boolean = false };
     return .{ .integer = std.fmt.parseInt(i64, s, 10) catch return Error.InvalidToml };
 }
 
@@ -592,6 +714,13 @@ fn scalarString(v: TomlScalar) Error![]const u8 {
 fn scalarU32(v: TomlScalar) Error!u32 {
     return switch (v) {
         .integer => |i| if (i < 0) Error.BadFieldType else @intCast(i),
+        else => Error.BadFieldType,
+    };
+}
+
+fn scalarBool(v: TomlScalar) Error!bool {
+    return switch (v) {
+        .boolean => |b| b,
         else => Error.BadFieldType,
     };
 }
@@ -665,6 +794,14 @@ fn applyTomlPair(arena: Allocator, section: TomlSection, key: []const u8, value:
                 m.defaults.output_compression = try scalarU32(value);
             } else if (std.mem.eql(u8, key, "steps")) {
                 m.defaults.steps = try scalarU32(value);
+            } else if (std.mem.eql(u8, key, "duration")) {
+                m.defaults.duration = try scalarU32(value);
+            } else if (std.mem.eql(u8, key, "resolution")) {
+                m.defaults.resolution = try arena.dupe(u8, try scalarString(value));
+            } else if (std.mem.eql(u8, key, "ratio")) {
+                m.defaults.ratio = try arena.dupe(u8, try scalarString(value));
+            } else if (std.mem.eql(u8, key, "watermark")) {
+                m.defaults.watermark = try scalarBool(value);
             } else {
                 return Error.UnsupportedToml;
             }
@@ -686,11 +823,23 @@ fn applyTomlPair(arena: Allocator, section: TomlSection, key: []const u8, value:
     }
 }
 
-fn applyTomlRootPair(arena: Allocator, key: []const u8, value: TomlScalar, output_dir: *?[]const u8, concurrency: *u32) Error!void {
+/// Root-level (`[models...]`-less) TOML keys.
+const RootBuilder = struct {
+    output_dir: ?[]const u8 = null,
+    concurrency: u32 = 0,
+    poll_interval: u32 = default_poll_interval,
+    task_timeout: u32 = default_task_timeout,
+};
+
+fn applyTomlRootPair(arena: Allocator, key: []const u8, value: TomlScalar, root: *RootBuilder) Error!void {
     if (std.mem.eql(u8, key, "output_dir")) {
-        output_dir.* = try arena.dupe(u8, try scalarString(value));
+        root.output_dir = try arena.dupe(u8, try scalarString(value));
     } else if (std.mem.eql(u8, key, "concurrency")) {
-        concurrency.* = try scalarU32(value);
+        root.concurrency = try scalarU32(value);
+    } else if (std.mem.eql(u8, key, "poll_interval")) {
+        root.poll_interval = try scalarU32(value);
+    } else if (std.mem.eql(u8, key, "task_timeout")) {
+        root.task_timeout = try scalarU32(value);
     } else {
         return Error.UnsupportedToml;
     }
@@ -716,8 +865,7 @@ pub fn loadTomlFromBytes(gpa: Allocator, toml_bytes: []const u8, env: Env) Error
     errdefer arena_ptr.deinit();
     const arena = arena_ptr.allocator();
 
-    var output_dir: ?[]const u8 = null;
-    var concurrency: u32 = 0;
+    var root: RootBuilder = .{};
     var models = std.array_hash_map.String(ModelBuilder).empty;
     defer models.deinit(gpa);
 
@@ -736,7 +884,7 @@ pub fn loadTomlFromBytes(gpa: Allocator, toml_bytes: []const u8, env: Env) Error
         const key = try parseTomlKeySegment(arena, line[0..eq]);
         const value = try parseTomlScalar(arena, line[eq + 1 ..]);
         switch (section) {
-            .root => try applyTomlRootPair(arena, key, value, &output_dir, &concurrency),
+            .root => try applyTomlRootPair(arena, key, value, &root),
             else => try applyTomlPair(arena, section, key, value),
         }
     }
@@ -767,9 +915,12 @@ pub fn loadTomlFromBytes(gpa: Allocator, toml_bytes: []const u8, env: Env) Error
     return .{
         .gpa = gpa,
         .arena = arena_ptr,
-        .output_dir = output_dir orelse try arena.dupe(u8, "~/.imagine/outputs"),
-        .concurrency = concurrency,
+        .output_dir = root.output_dir orelse try arena.dupe(u8, "~/.imagine/outputs"),
+        .concurrency = root.concurrency,
+        .poll_interval = root.poll_interval,
+        .task_timeout = root.task_timeout,
         .models = out_models,
+        .presets = try loadPresets(arena, env),
         .source_format = .toml,
     };
 }
@@ -796,6 +947,8 @@ pub fn loadJsonFromBytes(gpa: Allocator, json_bytes: []const u8, env: Env) Error
         try arena.dupe(u8, "~/.imagine/outputs");
 
     const concurrency: u32 = (try getU32(root, "concurrency")) orelse 0;
+    const poll_interval: u32 = (try getU32(root, "poll_interval")) orelse default_poll_interval;
+    const task_timeout: u32 = (try getU32(root, "task_timeout")) orelse default_task_timeout;
 
     const models_v = root.get("models") orelse return Error.MissingModels;
     if (models_v != .object) return Error.MissingModels;
@@ -814,7 +967,10 @@ pub fn loadJsonFromBytes(gpa: Allocator, json_bytes: []const u8, env: Env) Error
         .arena = arena_ptr,
         .output_dir = output_dir,
         .concurrency = concurrency,
+        .poll_interval = poll_interval,
+        .task_timeout = task_timeout,
         .models = models,
+        .presets = try loadPresets(arena, env),
         .source_format = .json,
     };
 }
@@ -874,7 +1030,8 @@ fn tomlStringAlloc(arena: Allocator, s: []const u8) ![]const u8 {
 fn defaultsAny(d: types.ModelDefaults) bool {
     return d.size != null or d.width != null or d.height != null or
         d.output_format != null or d.output_compression != null or d.quality != null or
-        d.steps != null;
+        d.steps != null or d.duration != null or d.resolution != null or d.ratio != null or
+        d.watermark != null;
 }
 
 fn appendJsonFieldString(out: *std.ArrayList(u8), arena: Allocator, name: []const u8, value: []const u8, first: *bool, indent: []const u8) !void {
@@ -889,6 +1046,12 @@ fn appendJsonFieldU32(out: *std.ArrayList(u8), arena: Allocator, name: []const u
     try appendFmt(out, arena, "{s}{s}: {d}", .{ indent, try jsonStringAlloc(arena, name), value });
 }
 
+fn appendJsonFieldBool(out: *std.ArrayList(u8), arena: Allocator, name: []const u8, value: bool, first: *bool, indent: []const u8) !void {
+    if (!first.*) try out.appendSlice(arena, ",\n");
+    first.* = false;
+    try appendFmt(out, arena, "{s}{s}: {s}", .{ indent, try jsonStringAlloc(arena, name), if (value) "true" else "false" });
+}
+
 fn appendJsonDefaults(out: *std.ArrayList(u8), arena: Allocator, d: types.ModelDefaults, indent: []const u8) !void {
     try out.appendSlice(arena, "{\n");
     var first = true;
@@ -899,6 +1062,10 @@ fn appendJsonDefaults(out: *std.ArrayList(u8), arena: Allocator, d: types.ModelD
     if (d.output_compression) |v| try appendJsonFieldU32(out, arena, "output_compression", v, &first, indent);
     if (d.quality) |v| try appendJsonFieldString(out, arena, "quality", v, &first, indent);
     if (d.steps) |v| try appendJsonFieldU32(out, arena, "steps", v, &first, indent);
+    if (d.duration) |v| try appendJsonFieldU32(out, arena, "duration", v, &first, indent);
+    if (d.resolution) |v| try appendJsonFieldString(out, arena, "resolution", v, &first, indent);
+    if (d.ratio) |v| try appendJsonFieldString(out, arena, "ratio", v, &first, indent);
+    if (d.watermark) |v| try appendJsonFieldBool(out, arena, "watermark", v, &first, indent);
     try out.appendSlice(arena, "\n      }");
 }
 
@@ -907,6 +1074,8 @@ pub fn toJsonAlloc(arena: Allocator, cfg: Config) ![]const u8 {
     try out.appendSlice(arena, "{\n");
     try appendFmt(&out, arena, "  \"output_dir\": {s},\n", .{try jsonStringAlloc(arena, cfg.output_dir)});
     try appendFmt(&out, arena, "  \"concurrency\": {d},\n", .{cfg.concurrency});
+    try appendFmt(&out, arena, "  \"poll_interval\": {d},\n", .{cfg.poll_interval});
+    try appendFmt(&out, arena, "  \"task_timeout\": {d},\n", .{cfg.task_timeout});
     try out.appendSlice(arena, "  \"models\": {\n");
     for (cfg.models, 0..) |m, mi| {
         if (mi > 0) try out.appendSlice(arena, ",\n");
@@ -939,6 +1108,8 @@ pub fn toTomlAlloc(arena: Allocator, cfg: Config) ![]const u8 {
     var out = std.ArrayList(u8).empty;
     try appendFmt(&out, arena, "output_dir = {s}\n", .{try tomlStringAlloc(arena, cfg.output_dir)});
     try appendFmt(&out, arena, "concurrency = {d}\n", .{cfg.concurrency});
+    try appendFmt(&out, arena, "poll_interval = {d}\n", .{cfg.poll_interval});
+    try appendFmt(&out, arena, "task_timeout = {d}\n", .{cfg.task_timeout});
 
     for (cfg.models) |m| {
         const model_key = try tomlStringAlloc(arena, m.name);
@@ -963,6 +1134,10 @@ pub fn toTomlAlloc(arena: Allocator, cfg: Config) ![]const u8 {
             if (m.defaults.output_compression) |v| try appendFmt(&out, arena, "output_compression = {d}\n", .{v});
             if (m.defaults.quality) |v| try appendFmt(&out, arena, "quality = {s}\n", .{try tomlStringAlloc(arena, v)});
             if (m.defaults.steps) |v| try appendFmt(&out, arena, "steps = {d}\n", .{v});
+            if (m.defaults.duration) |v| try appendFmt(&out, arena, "duration = {d}\n", .{v});
+            if (m.defaults.resolution) |v| try appendFmt(&out, arena, "resolution = {s}\n", .{try tomlStringAlloc(arena, v)});
+            if (m.defaults.ratio) |v| try appendFmt(&out, arena, "ratio = {s}\n", .{try tomlStringAlloc(arena, v)});
+            if (m.defaults.watermark) |v| try appendFmt(&out, arena, "watermark = {s}\n", .{if (v) "true" else "false"});
         }
     }
     return out.toOwnedSlice(arena);
@@ -983,6 +1158,10 @@ pub const template =
     \\# your OpenAI-compatible deployments. Run `imagine models` to list them.
     \\output_dir = "~/.imagine/outputs"
     \\concurrency = 0
+    \\# Async (video) tasks: ask the provider for the task status every
+    \\# poll_interval seconds, and give up on one task after task_timeout.
+    \\poll_interval = 5
+    \\task_timeout = 600
     \\
     \\[models."MAI-Image-2.6"]
     \\backend = "openai_image"
@@ -1028,6 +1207,50 @@ pub const template =
     \\output_format = "png"
     \\output_compression = 100
     \\quality = "high"
+    \\
+    \\# --- Volcengine Ark (Seedream images / Seedance video) -----------------------
+    \\# Credential env: ARK_API_KEY. Both models are also built-in presets (see
+    \\# `imagine models`), so this block only matters when you want to override a
+    \\# URL, pin defaults, or add another endpoint.
+    \\# [models."doubao-seedance-2-5-260628"]
+    \\# backend = "seedance"
+    \\# api_model = "doubao-seedance-2-5-260628"
+    \\
+    \\# [[models."doubao-seedance-2-5-260628".endpoints]]
+    \\# base_url = "https://ark.cn-beijing.volces.com/api/v3/contents/generations/tasks"
+    \\# api_key_env = "ARK_API_KEY"
+    \\
+    \\# [models."doubao-seedance-2-5-260628".defaults]
+    \\# duration = 5                # seconds
+    \\# resolution = "720p"         # 480p | 720p | 1080p | 4k
+    \\# ratio = "16:9"
+    \\
+    \\# [models."doubao-seedream-5-0-260128"]
+    \\# backend = "volcengine_image"
+    \\# api_model = "doubao-seedream-5-0-260128"
+    \\
+    \\# [[models."doubao-seedream-5-0-260128".endpoints]]
+    \\# base_url = "https://ark.cn-beijing.volces.com/api/v3/images/generations"
+    \\# api_key_env = "ARK_API_KEY"
+    \\
+    \\# [models."doubao-seedream-5-0-260128".defaults]
+    \\# size = "2K"                 # tier (1K/2K/4K) or explicit WxH
+    \\# watermark = false           # Ark defaults to true
+    \\
+    \\# --- Google Gemini video (Omni, Interactions API) ---------------------------
+    \\# Credential env: GEMINI_API_KEY; the key travels in `x-goog-api-key`.
+    \\# [models."gemini-omni-1.1-flash"]
+    \\# backend = "gemini_video"
+    \\# api_model = "gemini-omni-1.1-flash"
+    \\
+    \\# [[models."gemini-omni-1.1-flash".endpoints]]
+    \\# base_url = "https://generativelanguage.googleapis.com/v1beta/interactions"
+    \\# api_key_env = "GEMINI_API_KEY"
+    \\# auth = "google_api_key"
+    \\
+    \\# [models."gemini-omni-1.1-flash".defaults]
+    \\# resolution = "720p"
+    \\# ratio = "16:9"
     \\
     \\# --- Local Qwen-Image-2.1 (optional) ---------------------------------------
     \\# Install the local server first (see integrations/qwen-image/README.md):
@@ -1277,6 +1500,189 @@ test "loadEphemeral respects IMAGINE_API_KEY and IMAGINE_API_MODEL" {
     try std.testing.expectEqualStrings("inline-secret", cfg.models[0].endpoints[0].resolved_key.?);
     try std.testing.expectEqual(types.AuthScheme.api_key, cfg.models[0].endpoints[0].auth);
     try std.testing.expectEqual(types.BackendKind.openai_image, cfg.models[0].backend);
+}
+
+test "video defaults and async task knobs parse from TOML" {
+    const a = std.testing.allocator;
+    const toml =
+        \\poll_interval = 2
+        \\task_timeout = 90
+        \\
+        \\[models."v"]
+        \\backend = "seedance"
+        \\api_model = "doubao-seedance-2-5-260628"
+        \\
+        \\[[models."v".endpoints]]
+        \\base_url = "https://ark.example.com/api/v3/contents/generations/tasks"
+        \\api_key_env = "ARK_API_KEY"
+        \\
+        \\[models."v".defaults]
+        \\duration = 5
+        \\resolution = "720p"
+        \\ratio = "16:9"
+        \\watermark = false
+        \\
+    ;
+    var cfg = try loadFromBytes(a, toml, Env.empty());
+    defer cfg.deinit();
+
+    try std.testing.expectEqual(@as(u32, 2), cfg.poll_interval);
+    try std.testing.expectEqual(@as(u32, 90), cfg.task_timeout);
+
+    const m = cfg.findModel("v").?;
+    try std.testing.expectEqual(types.BackendKind.seedance, m.backend);
+    try std.testing.expectEqual(types.Media.video, m.backend.media());
+    try std.testing.expectEqual(types.Flow.async_task, m.backend.flow());
+    try std.testing.expectEqual(@as(u32, 5), m.defaults.duration.?);
+    try std.testing.expectEqualStrings("720p", m.defaults.resolution.?);
+    try std.testing.expectEqualStrings("16:9", m.defaults.ratio.?);
+    try std.testing.expectEqual(false, m.defaults.watermark.?);
+}
+
+test "video defaults survive a TOML render and re-parse" {
+    const a = std.testing.allocator;
+    const toml =
+        \\[models."v"]
+        \\backend = "volcengine_image"
+        \\api_model = "doubao-seedream-5-0-260128"
+        \\
+        \\[[models."v".endpoints]]
+        \\base_url = "https://ark.example.com/api/v3/images/generations"
+        \\api_key_env = "ARK_API_KEY"
+        \\
+        \\[models."v".defaults]
+        \\size = "2K"
+        \\duration = 4
+        \\resolution = "1080p"
+        \\ratio = "9:16"
+        \\watermark = true
+        \\
+    ;
+    var cfg = try loadFromBytes(a, toml, Env.empty());
+    defer cfg.deinit();
+
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const rendered = try toTomlAlloc(arena.allocator(), cfg);
+
+    var cfg2 = try loadFromBytes(a, rendered, Env.empty());
+    defer cfg2.deinit();
+    const d = cfg2.findModel("v").?.defaults;
+    try std.testing.expectEqual(@as(u32, 4), d.duration.?);
+    try std.testing.expectEqualStrings("1080p", d.resolution.?);
+    try std.testing.expectEqualStrings("9:16", d.ratio.?);
+    try std.testing.expectEqual(true, d.watermark.?);
+
+    // The JSON renderer carries the same fields.
+    const as_json = try toJsonAlloc(arena.allocator(), cfg);
+    var cfg3 = try loadFromBytes(a, as_json, Env.empty());
+    defer cfg3.deinit();
+    try std.testing.expectEqual(true, cfg3.findModel("v").?.defaults.watermark.?);
+    try std.testing.expectEqualStrings("1080p", cfg3.findModel("v").?.defaults.resolution.?);
+}
+
+test "presets load, carry their credential env, and yield to config models" {
+    const a = std.testing.allocator;
+    var te = TestEnv{ .map = std.StringHashMap([]const u8).init(a) };
+    defer te.map.deinit();
+    try te.map.put("ARK_API_KEY", "ark-secret");
+
+    const toml =
+        \\[models."doubao-seedance-2-5-260628"]
+        \\backend = "seedance"
+        \\api_model = "my-endpoint-id"
+        \\
+        \\[[models."doubao-seedance-2-5-260628".endpoints]]
+        \\base_url = "https://example.com/tasks"
+        \\api_key = "k"
+        \\
+    ;
+    var cfg = try loadFromBytes(a, toml, te.env());
+    defer cfg.deinit();
+
+    try std.testing.expectEqual(presets.catalog.len, cfg.presets.len);
+
+    // Credentials are resolved for presets too, so `imagine models` can report
+    // readiness without a config file.
+    const seedream = cfg.findPreset("doubao-seedream-5-0-260128").?;
+    try std.testing.expectEqualStrings("ARK_API_KEY", seedream.endpoints[0].api_key_env.?);
+    try std.testing.expectEqualStrings("ark-secret", seedream.endpoints[0].resolved_key.?);
+    // No GEMINI_API_KEY in the test env, so that preset is not ready.
+    try std.testing.expect(cfg.findPreset("gemini-omni-1.1-flash").?.endpoints[0].resolved_key == null);
+
+    // A configured model of the same name shadows the preset.
+    try std.testing.expect(cfg.findPreset("doubao-seedance-2-5-260628") == null);
+    try std.testing.expectEqualStrings("my-endpoint-id", cfg.findModel("doubao-seedance-2-5-260628").?.api_model);
+}
+
+test "preset-only config needs no file and no ephemeral env" {
+    const a = std.testing.allocator;
+    var te = TestEnv{ .map = std.StringHashMap([]const u8).init(a) };
+    defer te.map.deinit();
+
+    var cfg = try loadPresetsOnly(a, te.env());
+    defer cfg.deinit();
+
+    try std.testing.expectEqual(Source.preset, cfg.source);
+    try std.testing.expectEqualStrings("preset", cfg.source.toString());
+    try std.testing.expectEqual(@as(usize, 0), cfg.models.len);
+    try std.testing.expectEqual(presets.catalog.len, cfg.presets.len);
+    try std.testing.expectEqual(default_poll_interval, cfg.poll_interval);
+    try std.testing.expectEqual(default_task_timeout, cfg.task_timeout);
+    // `-m <preset>` is the only way to pick one, so every preset is reachable.
+    try std.testing.expect(cfg.findPreset("doubao-seedance-2-5-260628") != null);
+}
+
+test "ephemeralKeyEnv follows IMAGINE_BACKEND" {
+    const a = std.testing.allocator;
+    var te = TestEnv{ .map = std.StringHashMap([]const u8).init(a) };
+    defer te.map.deinit();
+
+    try std.testing.expectEqualStrings("AZURE_OPENAI_APIKEY", ephemeralKeyEnv(te.env()));
+
+    try te.map.put(env_backend, "seedance");
+    try std.testing.expectEqualStrings("ARK_API_KEY", ephemeralKeyEnv(te.env()));
+
+    try te.map.put(env_backend, "volcengine_image");
+    try std.testing.expectEqualStrings("ARK_API_KEY", ephemeralKeyEnv(te.env()));
+
+    try te.map.put(env_backend, "gemini_video");
+    try std.testing.expectEqualStrings("GEMINI_API_KEY", ephemeralKeyEnv(te.env()));
+
+    // An explicit IMAGINE_API_KEY_ENV always wins.
+    try te.map.put(env_api_key_env, "MY_KEY");
+    try std.testing.expectEqualStrings("MY_KEY", ephemeralKeyEnv(te.env()));
+}
+
+test "loadEphemeral reads the video knobs and the backend's credential env" {
+    const a = std.testing.allocator;
+    var te = TestEnv{ .map = std.StringHashMap([]const u8).init(a) };
+    defer te.map.deinit();
+    try te.map.put(env_base_url, "https://ark.example.com/api/v3/contents/generations/tasks");
+    try te.map.put(env_model, "doubao-seedance-2-5-260628");
+    try te.map.put(env_backend, "seedance");
+    try te.map.put("ARK_API_KEY", "ark-secret");
+    try te.map.put(env_duration, "6");
+    try te.map.put(env_resolution, "1080p");
+    try te.map.put(env_ratio, "9:16");
+    try te.map.put(env_watermark, "false");
+    try te.map.put(env_poll_interval, "2");
+    try te.map.put(env_task_timeout, "120");
+
+    try std.testing.expect(ephemeralReady(te.env()));
+    var cfg = try loadEphemeral(a, te.env());
+    defer cfg.deinit();
+
+    const m = cfg.models[0];
+    try std.testing.expectEqual(types.BackendKind.seedance, m.backend);
+    try std.testing.expectEqualStrings("ARK_API_KEY", m.endpoints[0].api_key_env.?);
+    try std.testing.expectEqualStrings("ark-secret", m.endpoints[0].resolved_key.?);
+    try std.testing.expectEqual(@as(u32, 6), m.defaults.duration.?);
+    try std.testing.expectEqualStrings("1080p", m.defaults.resolution.?);
+    try std.testing.expectEqualStrings("9:16", m.defaults.ratio.?);
+    try std.testing.expectEqual(false, m.defaults.watermark.?);
+    try std.testing.expectEqual(@as(u32, 2), cfg.poll_interval);
+    try std.testing.expectEqual(@as(u32, 120), cfg.task_timeout);
 }
 
 test "ephemeralIncomplete when base url missing" {

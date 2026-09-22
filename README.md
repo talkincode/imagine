@@ -9,13 +9,18 @@
 
 ---
 
-A universal **image-generation CLI for AI agents**. Unified front-end
-parameters, routed to different backends by **configured** model name. One
-model can have multiple endpoints (URL + key) for concurrent scheduling.
-Single static Zig binary — no `curl`/`jq`/`base64` dependencies.
+A universal **image- and video-generation CLI for AI agents**. Unified
+front-end parameters, routed to different backends by **configured** model
+name. One model can have multiple endpoints (URL + key) for concurrent
+scheduling. Single static Zig binary — no `curl`/`jq`/`base64` dependencies.
 
-- **Unified params** → route to a backend by `-m <model>` (names from config).
+- **Unified params** → route to a backend by `-m <model>` (names from config or
+  the built-in presets).
 - **OpenAI-compatible by default** — `openai_image` speaks `/v1/images/generations`.
+- **Built-in video** — `seedance` (Volcengine Ark) and `gemini_video` (Gemini
+  Omni) create a provider task, poll it, and save the result; credentials come
+  from `ARK_API_KEY` / `GEMINI_API_KEY`.
+- **Built-in Volcengine images** — `volcengine_image` drives Ark Seedream.
 - **Dynamic models** — add/rename/remove models in config; discover with `imagine models`.
 - **Concurrent scheduling** — multiple endpoints per model are load-balanced.
 - **Agent-friendly** — `--json` machine output, `--dry-run`, meaningful exit codes.
@@ -86,12 +91,20 @@ imagine generate -m <model> -p "logo concept" -n 4 -o logo.png -c 4
 IMAGINE_BASE_URL="https://host/.../images/generations" \
 IMAGINE_MODEL="MAI-Image-2.6-Flash" AZURE_OPENAI_APIKEY="..." \
   imagine generate -p "a fox" -o fox.png
+
+# Video, no config file at all: built-in presets + one env key
+export ARK_API_KEY="..."              # Volcengine Ark (Seedance / Seedream)
+imagine generate -m doubao-seedance-2-5-260628 -p "a fox in snow" \
+  --duration 5 --resolution 720p --ratio 16:9 -o fox.mp4
+
+export GEMINI_API_KEY="..."           # Google Gemini Omni (video)
+imagine generate -m gemini-omni-1.1-flash -p "a marble run" --image first.png -o run.mp4
 ```
 
 ## Commands
 
 ```
-imagine generate -m <model> -p <prompt> [options]
+imagine generate -m <model> -p <prompt> [options]     # image or video
 imagine batch <manifest.json> [-c N] [--json]
 imagine svg render --input <svg> -o <png> [--width W --height H]
 imagine text render --text <text> -o <png> --width W [options]
@@ -117,6 +130,13 @@ imagine version | help
 | `--quality <q>` | `low` / `medium` / `high` / `auto` (`openai_image`) |
 | `--seed <int>` | Seed (where supported) |
 | `--steps <n>` | Denoising steps for `qwen_image` (`num_inference_steps`) |
+| `--image <path\|url>` | First-frame / reference image (image-to-video, Seedream editing) |
+| `--watermark` / `--no-watermark` | Force the provider watermark on/off (Ark) |
+| `--duration <sec>` | Clip length in seconds (video) |
+| `--resolution <r>` | `480p` / `720p` / `1080p` / `4k` (video) |
+| `--ratio <r>` | Aspect ratio, e.g. `16:9` (video; `--size 16:9` works too) |
+| `--poll-interval <sec>` | Seconds between provider task polls (default 5) |
+| `--timeout <sec>` | Give up on one video task after N seconds (default 600) |
 | `-c, --concurrency <n>` | Parallel requests (default: endpoint count) |
 | `--config <path>` | Use a specific config file |
 | `--json` | Emit a JSON result object |
@@ -124,6 +144,53 @@ imagine version | help
 | `-q, --quiet` | Suppress progress |
 
 Exit codes: `0` success · `1` run failure (incl. partial) · `2` usage error.
+
+### Video generation
+
+Video models are routed exactly like image models — `-m <model>` plus the
+unified flags — but the provider flow is asynchronous: `imagine` creates a task,
+polls it until it is `succeeded`, then downloads the clip. Expect minutes, not
+seconds; `--poll-interval` and `--timeout` (or `poll_interval` / `task_timeout`
+in config) bound the wait, and one file is written per task (`-n 3` = three
+provider tasks). Progress prints a `start …` line when a task is submitted.
+
+| Backend | Provider / API | Credential env |
+|---------|----------------|----------------|
+| `seedance` | Volcengine Ark `contents/generations/tasks` (Seedance) | `ARK_API_KEY` |
+| `gemini_video` | Google Gemini Interactions API (Omni) | `GEMINI_API_KEY` (`x-goog-api-key`) |
+
+```bash
+# Volcengine Ark Seedance — text to video
+imagine generate -m doubao-seedance-2-5-260628 -p "a fox running through snow" \
+  --duration 5 --resolution 720p --ratio 16:9 -o fox.mp4
+
+# …or image to video (local file becomes a base64 data URL)
+imagine generate -m doubao-seedance-2-5-260628 -p "the fox turns and looks at us" \
+  --image fox.png --duration 5 -o fox-turn.mp4
+
+# Google Gemini Omni (Interactions API)
+imagine generate -m gemini-omni-1.1-flash -p "a marble run, smooth continuous shot" \
+  --resolution 720p -o marble.mp4
+```
+
+Both models are **built-in presets**: with the credential env set you can call
+them with no config file at all. `imagine models` lists them with
+`source: "preset"`; defining a model of the same name in config overrides the
+preset (URL, `api_model`, defaults, extra endpoints). Google's Veo models use a
+different (non-Interactions) API and are not wired to this backend.
+
+Ark's `--size` has no pixel meaning for video, so a `W:H` token is sent as the
+aspect ratio; `--format mp4|mov` picks the container where the provider supports
+it (Seedance 2.5 — Gemini Omni has no container parameter, so it always writes
+`.mp4`). Gemini Omni always produces audio.
+
+`--image` accepts a path or an `http(s)` URL. Local files are read and inlined
+(the Ark request body is capped at 64 MB); a URL is passed through where the
+provider accepts one, and fetched by `imagine` where it does not (Gemini only
+takes bytes). The declared image type comes from the file's magic bytes, so an
+extension-less URL works. Backends that take no image input (`openai_image`,
+`azure_flux`, `qwen_image`) reject `--image` with a usage error rather than
+ignoring it.
 
 ### image composition
 
@@ -195,6 +262,9 @@ Put preferred sizes in each model's `defaults`, discover models with
 | `openai_image` | `--size` (e.g. `1024x1024`); optional `--format` / `--quality` |
 | `azure_flux` | `--width` / `--height` (and optional `--seed`) |
 | `qwen_image` | `--size` (`WxH` or a native ratio token such as `16:9`), `--steps`, `--seed`, `--format` |
+| `volcengine_image` | `--size` (tier `1K`/`2K`/`4K` or `WxH`), `--format`, `--no-watermark` |
+| `seedance` | `--duration`, `--resolution`, `--ratio`, `--image`, `--no-watermark` |
+| `gemini_video` | `--duration`, `--resolution`, `--ratio`, `--image`, `--seed` |
 
 ### Local Qwen-Image-2.1 (optional)
 
@@ -246,13 +316,19 @@ and troubleshooting live in
   "jobs": [
     { "model": "<model-a>", "prompt": "a fox",  "output": "out/fox.png" },
     { "model": "<model-b>", "prompt": "a city", "output": "out/city.png", "width": 1024, "height": 1024, "n": 2 },
-    { "model": "<model-c>", "prompt": "a tree", "output": "out/tree.png", "size": "512x512" }
+    { "model": "<model-c>", "prompt": "a tree", "output": "out/tree.png", "size": "512x512" },
+    { "model": "doubao-seedance-2-5-260628", "prompt": "a fox in snow", "output": "out/fox.mp4",
+      "duration": 5, "resolution": "720p", "ratio": "16:9" },
+    { "model": "gemini-omni-1.1-flash", "prompt": "the fox turns", "output": "out/turn.mp4",
+      "image": "fox.png", "resolution": "1080p" }
   ]
 }
 ```
 
-Per-job keys: `model, prompt, output, size, width, height, n, format, compression, quality, seed, steps`.
-Use model names from `imagine models`.
+Per-job keys: `model, prompt, output, size, width, height, n, format, compression, quality,
+seed, steps, duration, resolution, ratio, image, watermark`.
+Use model names from `imagine models` (config models or built-in presets).
+`--poll-interval` / `--timeout` apply to every video job in the manifest.
 
 ## Configuration
 
@@ -270,7 +346,9 @@ cp config.example.toml ~/.imagine/config.toml   # then edit URLs/keys/model name
 
 ```toml
 output_dir = "~/.imagine/outputs"
-concurrency = 0 # 0 = auto (endpoint count)
+concurrency = 0     # 0 = auto (endpoint count)
+poll_interval = 5   # video: seconds between provider task polls
+task_timeout = 600  # video: give up on one task after N seconds
 
 # Table key = logical name for -m; rename freely.
 [models."my-image"]
@@ -280,7 +358,7 @@ api_model = "deployment-or-model-id"
 [[models."my-image".endpoints]]
 base_url = "https://<resource>.services.ai.azure.com/openai/v1/images/generations"
 api_key_env = "AZURE_OPENAI_APIKEY" # or api_key = "literal"
-auth = "bearer" # bearer | api-key | none  (none = local server, no credential)
+auth = "bearer" # bearer | api-key | google_api_key | none  (none = local server)
 
 [models."my-image".defaults]
 size = "1024x1024"
@@ -288,10 +366,38 @@ output_format = "png"
 output_compression = 100
 quality = "high"
 steps = 40 # qwen_image: num_inference_steps (optional)
+
+# A video model: the create URL goes in base_url, the provider task is polled
+# by imagine. `seedance` and `gemini_video` are async; `volcengine_image` is not.
+[models."my-video"]
+backend = "seedance"
+api_model = "doubao-seedance-2-5-260628"
+
+[[models."my-video".endpoints]]
+base_url = "https://ark.cn-beijing.volces.com/api/v3/contents/generations/tasks"
+api_key_env = "ARK_API_KEY"
+
+[models."my-video".defaults]
+duration = 5        # seconds
+resolution = "720p" # 480p | 720p | 1080p | 4k
+ratio = "16:9"
 ```
 
+Backends: `openai_image`, `azure_flux`, `qwen_image`, `volcengine_image`,
+`seedance`, `gemini_video`. The three provider backends also ship as built-in
+presets (see `presets.zig` and `imagine models`) so a first-party model can be
+called without a config file; a config entry with the same name wins.
+
 Precedence — params: CLI > model `defaults` > built-in. Keys: endpoint
-`api_key` > `api_key_env`.
+`api_key` > `api_key_env`. Video task bounds: `--poll-interval`/`--timeout` >
+`poll_interval`/`task_timeout` > built-in defaults.
+
+Ephemeral mode (no config file) reads the same knobs from the environment:
+`IMAGINE_DURATION`, `IMAGINE_RESOLUTION`, `IMAGINE_RATIO`, `IMAGINE_WATERMARK`,
+`IMAGINE_POLL_INTERVAL`, `IMAGINE_TASK_TIMEOUT`. The credential default follows
+the backend: `IMAGINE_BACKEND=seedance` looks for `ARK_API_KEY`,
+`IMAGINE_BACKEND=gemini_video` for `GEMINI_API_KEY`, everything else for
+`AZURE_OPENAI_APIKEY` (override with `IMAGINE_API_KEY_ENV`).
 
 Convert an existing JSON config to TOML:
 
@@ -302,16 +408,24 @@ imagine config convert --config ~/.imagine/config.json --to toml -o ~/.imagine/c
 ### `--json` result
 
 ```json
-{ "ok": true, "model": "my-image", "backend": "openai_image",
+{ "ok": true, "media": "image", "model": "my-image", "backend": "openai_image",
   "requested": 1, "succeeded": 1, "failed": 0,
-  "images": [ { "path": "fox.png", "bytes": 12345 } ], "errors": [] }
+  "images": [ { "path": "fox.png", "bytes": 12345 } ],
+  "videos": [], "errors": [] }
 ```
+
+`media` is `image` or `video`, and assets land in the matching array — the other
+one is always present and empty, so the shape never changes. `batch` reports one
+entry per task with the same `media` field. Providers report video failures
+inside an HTTP 200 response body; those surface in `errors[]` with the task id,
+e.g. `task cgt-… failed: …`.
 
 ## Development
 
 ```bash
 make build      # zig build -Doptimize=ReleaseFast -Dsvg-overlay=true
 make test       # zig build test -Dsvg-overlay=true
+make e2e        # end-to-end against a local mock provider (needs python3)
 make run ARGS="generate -m <model> -p 'a fox' --dry-run"
 make build-core # build without optional svg/text render support
 make test-svg

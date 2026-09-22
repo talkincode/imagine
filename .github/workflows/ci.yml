@@ -97,6 +97,25 @@ jobs:
           zig-out/bin/imagine png compose --base "$RUNNER_TEMP/badge.png" --layer "$RUNNER_TEMP/text.png,x=0,y=0" -o "$RUNNER_TEMP/composed.png"
           ls -l "$RUNNER_TEMP/badge.png" "$RUNNER_TEMP/text.png" "$RUNNER_TEMP/composed.png"
 
+  e2e:
+    name: end-to-end (mock providers)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Zig
+        uses: mlugg/setup-zig@v2
+        with:
+          version: ${{ env.ZIG_VERSION }}
+
+      - name: Build
+        run: zig build -Doptimize=ReleaseSafe
+
+      # Drives the real client path (create -> poll -> download, file writes,
+      # --json output) against scripts/mock_providers.py: no network, no keys.
+      - name: End-to-end
+        run: scripts/e2e.sh zig-out/bin/imagine
+
   fmt:
     name: zig fmt
     runs-on: ubuntu-latest

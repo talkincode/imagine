@@ -1,10 +1,12 @@
 //! Concurrent task scheduler.
 //!
-//! A `Task` is one image-generation unit already bound to a concrete endpoint.
-//! Endpoint assignment (round-robin across a model's endpoints) happens in the
-//! command layer; the scheduler just runs up to `concurrency` tasks in
-//! parallel. Worker threads share one threadsafe `std.http.Client` and each
-//! task owns a private arena, so there is no cross-thread allocator contention.
+//! A `Task` is one generation unit (image or video) already bound to a concrete
+//! endpoint. Endpoint assignment (round-robin across a model's endpoints)
+//! happens in the command layer; the scheduler just runs up to `concurrency`
+//! tasks in parallel. Worker threads share one threadsafe `std.http.Client` and
+//! each task owns a private arena, so there is no cross-thread allocator
+//! contention. Video tasks keep their worker busy while polling their provider
+//! task, which is exactly the intended back-pressure.
 
 const std = @import("std");
 const types = @import("types.zig");
@@ -15,7 +17,7 @@ pub const Task = struct {
     // ---- inputs (filled by caller) ----
     model: *const types.ModelConfig,
     endpoint: *const types.Endpoint,
-    req: types.ImageRequest,
+    req: types.GenRequest,
     /// Final output path (single image) or stem (multiple images), already
     /// tilde-expanded. Multiple images become `<stem>-N.<ext>`.
     output_path: []const u8,
@@ -39,6 +41,10 @@ pub const RunOptions = struct {
     client: *std.http.Client,
     /// Print one progress line per finished task to stderr.
     progress: bool = true,
+    /// Async-task backends (video): seconds between status polls.
+    poll_interval_secs: u32 = 5,
+    /// Async-task backends (video): overall deadline for one task, in seconds.
+    timeout_secs: u32 = 600,
 };
 
 const Context = struct {
@@ -95,7 +101,23 @@ fn workerLoop(ctx: *Context) void {
 fn processTask(ctx: *Context, task: *Task, index: usize) void {
     const a = task.arena.allocator();
 
-    const result = backend.generate(ctx.opts.client, a, task.model, task.endpoint, task.req) catch |e| {
+    // Video tasks run for minutes; say what the wait is before going quiet.
+    if (ctx.opts.progress and task.model.backend.flow() == .async_task) {
+        std.debug.print("[{d}/{d}] start {s} -> {s} (polling every {d}s, up to {d}s)\n", .{
+            index + 1,
+            ctx.tasks.len,
+            task.model.name,
+            task.output_path,
+            ctx.opts.poll_interval_secs,
+            ctx.opts.timeout_secs,
+        });
+    }
+
+    const result = backend.generate(ctx.opts.client, a, task.model, task.endpoint, task.req, .{
+        .io = ctx.opts.io,
+        .poll_interval_secs = ctx.opts.poll_interval_secs,
+        .timeout_secs = ctx.opts.timeout_secs,
+    }) catch |e| {
         task.err = std.fmt.allocPrint(a, "out of memory: {s}", .{@errorName(e)}) catch "out of memory";
         report(ctx, task, index);
         return;
@@ -107,8 +129,8 @@ fn processTask(ctx: *Context, task: *Task, index: usize) void {
         return;
     }
 
-    writeImages(ctx.opts.io, a, task, result.images) catch |e| {
-        task.err = std.fmt.allocPrint(a, "failed to write image: {s}", .{@errorName(e)}) catch "write error";
+    writeAssets(ctx.opts.io, a, task, result.assets) catch |e| {
+        task.err = std.fmt.allocPrint(a, "failed to write output: {s}", .{@errorName(e)}) catch "write error";
         report(ctx, task, index);
         return;
     };
@@ -116,20 +138,20 @@ fn processTask(ctx: *Context, task: *Task, index: usize) void {
     report(ctx, task, index);
 }
 
-fn writeImages(io: std.Io, a: std.mem.Allocator, task: *Task, images: [][]u8) !void {
-    const paths = try a.alloc([]const u8, images.len);
+fn writeAssets(io: std.Io, a: std.mem.Allocator, task: *Task, assets: [][]u8) !void {
+    const paths = try a.alloc([]const u8, assets.len);
     var total: usize = 0;
     const cwd = std.Io.Dir.cwd();
-    for (images, 0..) |img, i| {
-        const path = if (images.len == 1)
+    for (assets, 0..) |asset, i| {
+        const path = if (assets.len == 1)
             task.output_path
         else
             try util.numberedPath(a, task.output_path, i + 1);
 
         try util.ensureParentDir(io, cwd, path);
-        try cwd.writeFile(io, .{ .sub_path = path, .data = img });
+        try cwd.writeFile(io, .{ .sub_path = path, .data = asset });
         paths[i] = path;
-        total += img.len;
+        total += asset.len;
     }
     task.written_paths = paths;
     task.bytes_total = total;

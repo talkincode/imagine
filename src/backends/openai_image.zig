@@ -11,7 +11,7 @@
 const std = @import("std");
 const types = @import("../types.zig");
 
-pub fn buildBody(allocator: std.mem.Allocator, req: types.ImageRequest) ![]u8 {
+pub fn buildBody(allocator: std.mem.Allocator, req: types.GenRequest) ![]u8 {
     // Prefer an explicit size; otherwise synthesize one from width/height.
     var size_buf: [32]u8 = undefined;
     const size: ?[]const u8 = req.size orelse blk: {
@@ -46,7 +46,7 @@ pub fn buildBody(allocator: std.mem.Allocator, req: types.ImageRequest) ![]u8 {
 
 test "openai_image body omits nulls" {
     const a = std.testing.allocator;
-    const req = types.ImageRequest{
+    const req = types.GenRequest{
         .prompt = "a fox",
         .api_model = "my-deployment",
         .n = 1,
@@ -65,7 +65,7 @@ test "openai_image body omits nulls" {
 
 test "openai_image derives size from width/height" {
     const a = std.testing.allocator;
-    const req = types.ImageRequest{ .prompt = "x", .api_model = "img", .n = 1, .width = 512, .height = 768 };
+    const req = types.GenRequest{ .prompt = "x", .api_model = "img", .n = 1, .width = 512, .height = 768 };
     const body = try buildBody(a, req);
     defer a.free(body);
     try std.testing.expect(std.mem.indexOf(u8, body, "\"size\":\"512x768\"") != null);

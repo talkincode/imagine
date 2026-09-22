@@ -58,6 +58,11 @@ test-core: ## Run unit tests without optional SVG/text render support
 test-svg: ## Run tests with SVG rendering/composition support enabled
 	$(ZIG) build test -Dsvg-overlay=true $(if $(RESVG_INCLUDE),-Dresvg-include=$(RESVG_INCLUDE),) $(if $(RESVG_LIB),-Dresvg-lib=$(RESVG_LIB),)
 
+.PHONY: e2e
+e2e: ## End-to-end checks against a local mock provider (needs python3)
+	$(ZIG) build -Doptimize=$(OPTIMIZE) $(SVG_FLAGS)
+	scripts/e2e.sh $(BUILD_BIN)
+
 .PHONY: run
 run: ## Build & run (use ARGS="generate -m ... -p ...")
 	$(ZIG) build run $(SVG_FLAGS) -- $(ARGS)

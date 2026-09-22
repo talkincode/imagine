@@ -26,6 +26,20 @@ pub const Generate = struct {
     quality: ?[]const u8 = null,
     seed: ?i64 = null,
     steps: ?u32 = null,
+    /// Video: clip length in seconds.
+    duration: ?u32 = null,
+    /// Video: resolution token (`720p`, `1080p`, ...).
+    resolution: ?[]const u8 = null,
+    /// Video: aspect-ratio token (`16:9`, `9:16`, ...).
+    ratio: ?[]const u8 = null,
+    /// First-frame / reference image: a path or an http(s) URL.
+    image: ?[]const u8 = null,
+    /// Ark watermark; unset leaves the provider default alone.
+    watermark: ?bool = null,
+    /// Async video tasks: seconds between status polls.
+    poll_interval: ?u32 = null,
+    /// Async video tasks: overall deadline in seconds.
+    timeout: ?u32 = null,
     concurrency: ?usize = null,
     dry_run: bool = false,
     quiet: bool = false,
@@ -35,6 +49,10 @@ pub const Batch = struct {
     common: Common = .{},
     manifest: ?[]const u8 = null,
     concurrency: ?usize = null,
+    /// Async video tasks: seconds between status polls.
+    poll_interval: ?u32 = null,
+    /// Async video tasks: overall deadline in seconds.
+    timeout: ?u32 = null,
     dry_run: bool = false,
     quiet: bool = false,
 };
@@ -114,19 +132,19 @@ pub const Parsed = union(enum) {
 };
 
 pub const usage =
-    \\imagine — universal image generation CLI for AI agents
+    \\imagine — universal image & video generation CLI for AI agents
     \\
     \\USAGE:
     \\  imagine <command> [options]
     \\
     \\COMMANDS:
-    \\  generate        Generate image(s) from a prompt
+    \\  generate        Generate image(s) or a video from a prompt
     \\  batch <file>    Generate from a JSON manifest of jobs
     \\  svg render      Render an SVG to a PNG
     \\  png compose     Compose PNG layers over a base PNG
     \\  text render     Render styled text to a transparent PNG
     \\  compose         Shortcut: render one SVG and overlay it on a PNG
-    \\  models          List configured models (--json for machine output)
+    \\  models          List configured models + built-in presets (--json for machine)
     \\  config path     Print the resolved config file path
     \\  config init     Write a starter config (--force to overwrite)
     \\  config convert  Convert config between TOML and JSON
@@ -138,20 +156,30 @@ pub const usage =
     \\  -m, --model <name>        Model to route to (optional if only one model)
     \\  -p, --prompt <text>       Text prompt (required; or pass as positional)
     \\  -o, --output <path>       Output file (single) or stem (multiple)
-    \\  -n, --n <count>           Number of images (default 1)
-    \\  -s, --size <WxH>          Size string for openai_image backends
+    \\  -n, --n <count>           Number of assets (default 1)
+    \\  -s, --size <WxH|token>    Size string (openai_image); a ratio token for video
     \\      --width <px>          Width (azure_flux; also derives size for openai_image)
     \\      --height <px>         Height (azure_flux; also derives size for openai_image)
-    \\      --format <fmt>        png | jpeg   (openai_image output_format)
+    \\      --format <fmt>        png | jpeg | mp4 | mov  (provider output format)
     \\      --compression <0-100> Output compression (openai_image)
     \\      --quality <q>         low | medium | high | auto   (openai_image)
     \\      --seed <int>          Seed (where supported)
     \\      --steps <n>           Denoising steps (qwen_image num_inference_steps)
+    \\      --image <path|url>    First-frame / reference image (image-to-video)
+    \\      --watermark           Force the provider watermark on
+    \\      --no-watermark        Force the provider watermark off
     \\  -c, --concurrency <num>   Parallel requests (default: endpoint count)
     \\      --config <path>       Use a specific config file
     \\      --json                Emit a JSON result object to stdout
     \\      --dry-run             Print request bodies without calling the API
     \\  -q, --quiet               Suppress progress output
+    \\
+    \\VIDEO OPTIONS (seedance | gemini_video backends):
+    \\      --duration <sec>      Clip length in seconds
+    \\      --resolution <r>      480p | 720p | 1080p | 4k
+    \\      --ratio <r>           16:9 | 9:16 | 1:1 | ...   (also --size <ratio>)
+    \\      --poll-interval <sec> Seconds between task status polls (default 5)
+    \\      --timeout <sec>       Give up on one video task after N seconds (default 600)
     \\
     \\SVG RENDER OPTIONS:
     \\      --input <svg>         Input SVG (required)
@@ -192,24 +220,32 @@ pub const usage =
     \\MODELS:
     \\  Logical model names come from ~/.imagine/config.toml (dynamic), or from
     \\  ephemeral env when no config file exists. Run `imagine models`.
-    \\  backends: openai_image (OpenAI-compatible /v1/images/generations)
-    \\            azure_flux    (Azure FLUX; uses --width/--height)
-    \\            qwen_image    (local Qwen-Image server; uses --size/--steps)
+    \\  backends: openai_image     (OpenAI-compatible /v1/images/generations)
+    \\            azure_flux       (Azure FLUX; uses --width/--height)
+    \\            qwen_image       (local Qwen-Image server; uses --size/--steps)
+    \\            volcengine_image (Ark Seedream image; env ARK_API_KEY)
+    \\            seedance         (Ark Seedance video; env ARK_API_KEY)
+    \\            gemini_video     (Gemini Omni video; env GEMINI_API_KEY)
+    \\  Video backends create a provider task and poll it: expect minutes, not
+    \\  seconds. They write one file per task and default to the .mp4 extension.
     \\  Self-hosted endpoints (e.g. a local Qwen-Image server) need no credential:
     \\  set auth = "none" on the endpoint, or IMAGINE_AUTH=none when going ephemeral.
     \\  Size limits are provider-specific; use model defaults in config or --dry-run.
     \\
     \\ENVIRONMENT:
     \\  IMAGINE_CONFIG            Override config path (default ~/.imagine/config.toml)
-    \\  AZURE_OPENAI_APIKEY       Default credential env (file starter + ephemeral)
-    \\  IMAGINE_BASE_URL          Ephemeral: images endpoint URL (required if no file)
+    \\  AZURE_OPENAI_APIKEY       Default credential for OpenAI/Azure backends
+    \\  ARK_API_KEY               Credential for volcengine_image / seedance
+    \\  GEMINI_API_KEY            Credential for gemini_video
+    \\  IMAGINE_BASE_URL          Ephemeral: endpoint URL (required if no file)
     \\  IMAGINE_MODEL             Ephemeral: logical model name (required if no file)
     \\  IMAGINE_API_MODEL         Ephemeral: api model field (default: IMAGINE_MODEL)
-    \\  IMAGINE_BACKEND           Ephemeral: openai_image | azure_flux (default openai_image)
-    \\  IMAGINE_AUTH              Ephemeral: bearer | api-key | none (default bearer)
+    \\  IMAGINE_BACKEND           Ephemeral: backend name (default openai_image)
+    \\  IMAGINE_AUTH              Ephemeral: bearer | api-key | google_api_key | none
     \\  IMAGINE_API_KEY           Ephemeral: inline API key (overrides env key)
-    \\  IMAGINE_API_KEY_ENV       Ephemeral: env var name for key (default AZURE_OPENAI_APIKEY)
+    \\  IMAGINE_API_KEY_ENV       Ephemeral: env var name for key (default: backend's)
     \\  IMAGINE_SIZE/WIDTH/STEPS  Ephemeral model defaults
+    \\  IMAGINE_DURATION/RESOLUTION/RATIO  Ephemeral video model defaults
     \\
     \\EXAMPLES:
     \\  imagine models --json
@@ -222,6 +258,10 @@ pub const usage =
     \\  IMAGINE_BASE_URL=http://127.0.0.1:8000/v1/images/generations \\
     \\  IMAGINE_MODEL=qwen-image-2.1 IMAGINE_BACKEND=qwen_image IMAGINE_AUTH=none \\
     \\    imagine generate -p "a neon Qwen sign" --size 16:9 --steps 40 -o qwen.png
+    \\  # video (Ark Seedance / Gemini Omni) — key from env, model from `imagine models`
+    \\  imagine generate -m doubao-seedance-2-5-260628 -p "a fox in snow" \\
+    \\    --duration 5 --resolution 720p --ratio 16:9 -o fox.mp4
+    \\  imagine generate -m gemini-omni-1.1-flash -p "a marble run" --image first.png -o run.mp4
     \\  imagine batch jobs.json
     \\  imagine svg render --input badge.svg -o badge.png --width 256
     \\  imagine text render --text "SALE\n50% OFF" -o copy.png --width 900 --font "PingFang SC" --size 72 --align center
@@ -342,6 +382,25 @@ fn parseGenerate(arena: std.mem.Allocator, args: []const []const u8) !Parsed {
         } else if (std.mem.eql(u8, name, "--steps")) {
             const v = (try cur.value(fs, arena)) orelse return missingValue(arena, name);
             g.steps = parseU32(v) orelse return .{ .err = try std.fmt.allocPrint(arena, "invalid --steps: {s}", .{v}) };
+        } else if (std.mem.eql(u8, name, "--duration")) {
+            const v = (try cur.value(fs, arena)) orelse return missingValue(arena, name);
+            g.duration = parseU32(v) orelse return .{ .err = try std.fmt.allocPrint(arena, "invalid --duration: {s}", .{v}) };
+        } else if (std.mem.eql(u8, name, "--resolution")) {
+            g.resolution = (try cur.value(fs, arena)) orelse return missingValue(arena, name);
+        } else if (std.mem.eql(u8, name, "--ratio")) {
+            g.ratio = (try cur.value(fs, arena)) orelse return missingValue(arena, name);
+        } else if (std.mem.eql(u8, name, "--image")) {
+            g.image = (try cur.value(fs, arena)) orelse return missingValue(arena, name);
+        } else if (std.mem.eql(u8, name, "--watermark")) {
+            g.watermark = true;
+        } else if (std.mem.eql(u8, name, "--no-watermark")) {
+            g.watermark = false;
+        } else if (std.mem.eql(u8, name, "--poll-interval")) {
+            const v = (try cur.value(fs, arena)) orelse return missingValue(arena, name);
+            g.poll_interval = parseU32(v) orelse return .{ .err = try std.fmt.allocPrint(arena, "invalid --poll-interval: {s}", .{v}) };
+        } else if (std.mem.eql(u8, name, "--timeout")) {
+            const v = (try cur.value(fs, arena)) orelse return missingValue(arena, name);
+            g.timeout = parseU32(v) orelse return .{ .err = try std.fmt.allocPrint(arena, "invalid --timeout: {s}", .{v}) };
         } else if (std.mem.eql(u8, name, "-c") or std.mem.eql(u8, name, "--concurrency")) {
             const v = (try cur.value(fs, arena)) orelse return missingValue(arena, name);
             g.concurrency = parseU32(v) orelse return .{ .err = try std.fmt.allocPrint(arena, "invalid --concurrency: {s}", .{v}) };
@@ -367,8 +426,24 @@ fn parseGenerate(arena: std.mem.Allocator, args: []const []const u8) !Parsed {
     if (g.steps) |s| {
         if (s == 0) return .{ .err = try arena.dupe(u8, "--steps must be >= 1") };
     }
+    if (g.duration) |d| {
+        if (d == 0) return .{ .err = try arena.dupe(u8, "--duration must be >= 1") };
+    }
+    if (try checkPollOptions(arena, g.poll_interval, g.timeout)) |err| return err;
 
     return .{ .command = .{ .generate = g } };
+}
+
+/// Both `generate` and `batch` bound async video tasks with these; a zero would
+/// silently mean "give up immediately", so it is a usage error instead.
+fn checkPollOptions(arena: std.mem.Allocator, poll_interval: ?u32, timeout: ?u32) !?Parsed {
+    if (poll_interval) |p| {
+        if (p == 0) return .{ .err = try arena.dupe(u8, "--poll-interval must be >= 1") };
+    }
+    if (timeout) |t| {
+        if (t == 0) return .{ .err = try arena.dupe(u8, "--timeout must be >= 1") };
+    }
+    return null;
 }
 
 fn parseBatch(arena: std.mem.Allocator, args: []const []const u8) !Parsed {
@@ -380,6 +455,12 @@ fn parseBatch(arena: std.mem.Allocator, args: []const []const u8) !Parsed {
         if (std.mem.eql(u8, name, "-c") or std.mem.eql(u8, name, "--concurrency")) {
             const v = (try cur.value(fs, arena)) orelse return missingValue(arena, name);
             b.concurrency = parseU32(v) orelse return .{ .err = try std.fmt.allocPrint(arena, "invalid --concurrency: {s}", .{v}) };
+        } else if (std.mem.eql(u8, name, "--poll-interval")) {
+            const v = (try cur.value(fs, arena)) orelse return missingValue(arena, name);
+            b.poll_interval = parseU32(v) orelse return .{ .err = try std.fmt.allocPrint(arena, "invalid --poll-interval: {s}", .{v}) };
+        } else if (std.mem.eql(u8, name, "--timeout")) {
+            const v = (try cur.value(fs, arena)) orelse return missingValue(arena, name);
+            b.timeout = parseU32(v) orelse return .{ .err = try std.fmt.allocPrint(arena, "invalid --timeout: {s}", .{v}) };
         } else if (std.mem.eql(u8, name, "--config")) {
             b.common.config_path = (try cur.value(fs, arena)) orelse return missingValue(arena, name);
         } else if (std.mem.eql(u8, name, "--json")) {
@@ -395,6 +476,7 @@ fn parseBatch(arena: std.mem.Allocator, args: []const []const u8) !Parsed {
         }
     }
     if (b.manifest == null) return .{ .err = try arena.dupe(u8, "batch requires a manifest file path") };
+    if (try checkPollOptions(arena, b.poll_interval, b.timeout)) |err| return err;
     return .{ .command = .{ .batch = b } };
 }
 

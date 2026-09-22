@@ -1,15 +1,15 @@
 ---
 name: imagine
-description: Use the imagine CLI to call OpenAI-compatible image APIs via config-file models or ephemeral env (IMAGINE_BASE_URL + IMAGINE_MODEL + AZURE_OPENAI_APIKEY) with no config file. Use for text-to-image, batch jobs, model discovery via `imagine models`, and --json results. Always discover models with `imagine models` first — do not hardcode model names. Check whether the imagine binary is installed first.
+description: Use the imagine CLI to generate images and videos — OpenAI-compatible image APIs via config-file models or ephemeral env (IMAGINE_BASE_URL + IMAGINE_MODEL + AZURE_OPENAI_APIKEY), plus built-in Volcengine Ark (Seedance video, Seedream images via ARK_API_KEY) and Google Gemini Omni video (GEMINI_API_KEY) with no config file. Use for text-to-image, text-to-video, image-to-video, batch jobs, model discovery via `imagine models`, and --json results. Always discover models with `imagine models` first — do not hardcode model names. Check whether the imagine binary is installed first.
 ---
 
-# imagine - Universal Image Generation CLI Skill
+# imagine - Universal Image & Video Generation CLI Skill
 
-`imagine` is a universal image-generation CLI for AI agents. It provides one
-frontend parameter set, routes requests to backends by **configured** model
-name, and can distribute one logical model across multiple endpoints
-(URL + key) for concurrent scheduling. It is a single static Zig binary and
-does not require `curl`, `jq`, or `base64`.
+`imagine` is a universal image- and video-generation CLI for AI agents. It
+provides one frontend parameter set, routes requests to backends by
+**configured** model name, and can distribute one logical model across multiple
+endpoints (URL + key) for concurrent scheduling. It is a single static Zig
+binary and does not require `curl`, `jq`, or `base64`.
 
 Model names are **not** fixed in the binary. They come from either:
 
@@ -17,19 +17,25 @@ Model names are **not** fixed in the binary. They come from either:
 2. **Ephemeral env** — when no config file exists: `IMAGINE_BASE_URL` +
    `IMAGINE_MODEL` + credential (`AZURE_OPENAI_APIKEY` / `IMAGINE_API_KEY` /
    `IMAGINE_API_KEY_ENV`)
+3. **Built-in presets** — first-party models (Volcengine Ark, Google Gemini) that
+   work with nothing but their API key in the environment
 
 Always run `imagine models` (or `imagine models --json`) before generating.
-Check the `source` field (`file` | `ephemeral`).
+Check the `source` field (`file` | `ephemeral` | `preset`) and the `media` field
+(`image` | `video`).
 
 ## When To Use This Skill
 
 - Generate one or more images from a text prompt and save them to disk.
-- Run batch generation from a JSON manifest with multiple jobs.
+- Generate a video from a text prompt, or from a first-frame image
+  (Seedance / Gemini Omni) — video tasks are asynchronous and take minutes.
+- Run batch generation from a JSON manifest with multiple jobs (mixed image and
+  video jobs are fine).
 - Overlay an SVG on a PNG with `compose` when the binary was built with optional
   `resvg` support.
 - Use `--json` when an agent needs structured output.
 - Inspect or initialize config, or troubleshoot missing models and credentials.
-- Zero-file agent/CI runs via ephemeral env (no `config init` required).
+- Zero-file agent/CI runs via ephemeral env or presets (no `config init`).
 
 ## Step 0: Check The Binary
 
@@ -70,14 +76,24 @@ exists for the platform, build from source with Zig >= 0.16.0.
 ## Step 1: Discover Models (required)
 
 ```bash
-imagine models               # list models + source=file|ephemeral
-imagine models --json        # machine-readable; each item includes "source"
-imagine config show          # effective config; includes "source"
+imagine models               # config models + built-in presets, with readiness
+imagine models --json        # machine-readable; each item has "source", "media", "ready"
+imagine config show          # effective config (no presets); includes "source"
 ```
 
 Pick a model name where `ready` is true. Use that exact name for `-m` / batch
 `"model"`. If exactly one model is configured (typical for ephemeral), `-m` may
 be omitted. Do **not** invent model names from this skill.
+
+`source` is `file` (config), `ephemeral` (IMAGINE_* env), or `preset` (built-in
+catalog). A config model with the same name as a preset always wins. Presets need
+no config file — just the credential env:
+
+```bash
+export ARK_API_KEY="..."        # Seedance video + Seedream images (Volcengine Ark)
+export GEMINI_API_KEY="..."     # Gemini Omni video
+imagine models --json           # these show source="preset", media="video"|"image"
+```
 
 ### Path A — Config file (multi-model / multi-endpoint)
 
@@ -119,8 +135,42 @@ Typical backends:
 | `openai_image` | OpenAI-compatible `/v1/images/generations` | `--size`, `--format`, `--quality` |
 | `azure_flux` | Azure FLUX | `--width` / `--height`, optional `--seed` |
 | `qwen_image` | Local Qwen-Image-2.1 server (`/v1/images/generations`) | `--size` (`WxH` or ratio token), `--steps`, `--seed`, `--format` |
+| `volcengine_image` | Volcengine Ark Seedream (sync) | `--size` (tier `1K`/`2K`/`4K` or `WxH`), `--format`, `--no-watermark`, `--image` |
+| `seedance` | Volcengine Ark video task (async) | `--duration`, `--resolution`, `--ratio`, `--image`, `--no-watermark` |
+| `gemini_video` | Google Gemini Interactions API / Omni (async) | `--duration`, `--resolution`, `--ratio`, `--image`, `--seed` |
 
 Legacy config value `azure_image` is accepted as an alias of `openai_image`.
+Video backends (`seedance`, `gemini_video`) report `media: "video"` and write
+`.mp4` by default.
+
+#### Video backends (`seedance`, `gemini_video`)
+
+Both are **asynchronous**: `imagine` creates a provider task, polls it until it
+succeeds, then downloads the clip. Expect minutes per clip. Relevant knobs:
+
+| Flag | Meaning |
+|------|---------|
+| `--duration <sec>` | Clip length (Ark: 2–30 s depending on model) |
+| `--resolution <r>` | `480p` / `720p` / `1080p` / `4k` (model-dependent) |
+| `--ratio <r>` | `16:9` / `9:16` / `1:1` / … (`--size 16:9` also works for video) |
+| `--image <path\|url>` | First-frame image (image-to-video); local files are inlined |
+| `--poll-interval <sec>` | Seconds between status polls (default 5; config `poll_interval`) |
+| `--timeout <sec>` | Give up on one task after N seconds (default 600; config `task_timeout`) |
+
+Progress prints `start <model> -> <path> (polling every Ns, up to Ms)` per task,
+then `ok`/`FAIL`. A timeout is a normal failure: it appears in `errors[]` as
+`task <id> did not finish within <n>s`. Provider-side failures (content policy,
+expired task) arrive as HTTP 200 with a failure status and surface in `errors[]`
+with the provider's message.
+
+`--image` accepts a path or an `http(s)` URL. Ark takes URLs and base64 data URLs;
+Gemini takes bytes only, so `imagine` downloads the URL first. Local files are
+read and inlined (keep them under ~30 MB). The declared image type comes from the
+file's magic bytes, so an extension-less URL is fine.
+
+`--format` picks the container where the provider supports it (Seedance 2.5:
+`mp4` or `mov`). Gemini Omni has no container parameter and always writes
+`.mp4`. `--size`/`--ratio` both set the aspect ratio for video.
 
 #### Local Qwen-Image-2.1 (`qwen_image`)
 
@@ -164,7 +214,13 @@ imagine generate -m <model> -p "a city at dusk" --width 1024 --height 1024 -o ci
 # Multiple images with concurrency; filenames get numbered automatically
 imagine generate -m <model> -p "logo concept" -n 4 -o logo.png -c 4
 
-# Inspect the request body without calling the API
+# Video (check `imagine models --json` for media="video" first)
+imagine generate -m doubao-seedance-2-5-260628 -p "a fox running through snow" \
+  --duration 5 --resolution 720p --ratio 16:9 -o fox.mp4
+imagine generate -m gemini-omni-1.1-flash -p "the fox turns and looks at us" \
+  --image fox.png -o fox-turn.mp4
+
+# Inspect the request body without calling the API (video: also prints the poll settings)
 imagine generate -m <model> -p "test" --dry-run
 
 # Structured output for agents
@@ -186,6 +242,10 @@ Common options:
 | `--quality` | `low`, `medium`, `high`, or `auto` for `openai_image` output. |
 | `--seed` | Seed where supported. |
 | `--steps` | Denoising steps for `qwen_image` (`num_inference_steps`; server default 40). |
+| `--image` | First-frame / reference image: path or URL. Only for backends that take one (`seedance`, `gemini_video`, `volcengine_image`); others reject it with a usage error. |
+| `--watermark` / `--no-watermark` | Force the Ark watermark on/off. |
+| `--duration` / `--resolution` / `--ratio` | Video length, resolution token, aspect ratio. |
+| `--poll-interval` / `--timeout` | Async video tasks: poll cadence and per-task deadline. |
 | `-c, --concurrency` | Parallel requests. Default: endpoint count. |
 | `--config` | Use a specific config file. |
 | `--json` | Emit a JSON result object. |
@@ -217,7 +277,21 @@ imagine batch jobs.json -c 4
 ```
 
 Each job supports: `model`, `prompt`, `output`, `size`, `width`, `height`, `n`,
-`format`, `compression`, `quality`, `seed`, and `steps`.
+`format`, `compression`, `quality`, `seed`, `steps`, and the video keys
+`duration`, `resolution`, `ratio`, `image`, `watermark`:
+
+```json
+{
+  "jobs": [
+    { "model": "doubao-seedance-2-5-260628", "prompt": "a fox in snow",
+      "output": "out/fox.mp4", "duration": 5, "resolution": "720p", "ratio": "16:9" },
+    { "model": "gemini-omni-1.1-flash", "prompt": "the fox turns",
+      "output": "out/turn.mp4", "image": "fox.png", "resolution": "1080p" }
+  ]
+}
+```
+
+`--poll-interval` / `--timeout` apply to every video job in the manifest.
 
 ## Step 4: SVG/PNG Composition
 
@@ -300,28 +374,37 @@ For product images, use `normal` for copy/text layers, `multiply` for shadows,
   usage error.
 - `--json` result object:
   ```json
-  { "ok": true, "model": "...", "backend": "openai_image",
+  { "ok": true, "media": "image", "model": "...", "backend": "openai_image",
     "requested": 1, "succeeded": 1, "failed": 0,
-    "images": [ { "path": "fox.png", "bytes": 12345 } ], "errors": [] }
+    "images": [ { "path": "fox.png", "bytes": 12345 } ],
+    "videos": [], "errors": [] }
   ```
-- Parse `images[].path` to find generated files. When `ok=false`, read
-  `errors[]`.
+- Parse `images[].path` (or `videos[].path` when `media` is `video`) to find
+  generated files. Both arrays are always present; the unused one is empty.
+  `batch` returns `tasks[]` with a per-task `media` field.
+- When `ok=false`, read `errors[]` — provider messages are passed through, and
+  video tasks report the provider task id.
 - **Always** run `imagine models --json` first and only generate with a model
   that has `ready=true`.
-- Use `--dry-run` when parameters are uncertain.
+- Use `--dry-run` when parameters are uncertain (for video it also prints the
+  poll interval and deadline that will be used).
 
 ## Environment Variables
 
 | Variable | Purpose |
 |----------|---------|
 | `IMAGINE_CONFIG` | Override the config path. Default: `~/.imagine/config.toml`. |
-| `AZURE_OPENAI_APIKEY` | Default credential for starter config and ephemeral mode. |
-| `IMAGINE_BASE_URL` | Ephemeral: images endpoint URL (required when no file). |
+| `AZURE_OPENAI_APIKEY` | Default credential for OpenAI/Azure backends (starter config + ephemeral). |
+| `ARK_API_KEY` | Credential for `volcengine_image` and `seedance`; also the default ephemeral credential when `IMAGINE_BACKEND` is one of them. |
+| `GEMINI_API_KEY` | Credential for `gemini_video` (sent as `x-goog-api-key`). |
+| `IMAGINE_BASE_URL` | Ephemeral: endpoint URL (required when no file; the *create* URL for video). |
 | `IMAGINE_MODEL` | Ephemeral: logical model name (required when no file). |
 | `IMAGINE_API_MODEL` | Ephemeral: API `model` field (default: `IMAGINE_MODEL`). |
-| `IMAGINE_BACKEND` | Ephemeral: `openai_image` \| `azure_flux` \| `qwen_image` (default `openai_image`). |
-| `IMAGINE_AUTH` | Ephemeral: `bearer` \| `api-key` \| `none` (default `bearer`; `none` needs no key). |
+| `IMAGINE_BACKEND` | Ephemeral: backend name (default `openai_image`). |
+| `IMAGINE_AUTH` | Ephemeral: `bearer` \| `api-key` \| `google_api_key` \| `none` (default `bearer`). |
 | `IMAGINE_STEPS` | Ephemeral: denoising steps for `qwen_image`. |
+| `IMAGINE_DURATION` / `IMAGINE_RESOLUTION` / `IMAGINE_RATIO` / `IMAGINE_WATERMARK` | Ephemeral: video defaults. |
+| `IMAGINE_POLL_INTERVAL` / `IMAGINE_TASK_TIMEOUT` | Ephemeral: async video task poll cadence and deadline. |
 | `IMAGINE_API_KEY` | Ephemeral: inline API key. |
 | `IMAGINE_API_KEY_ENV` | Ephemeral: name of env var holding the key. |
 | `IMAGINE_SIZE` / `IMAGINE_WIDTH` / `IMAGINE_HEIGHT` / `IMAGINE_FORMAT` / `IMAGINE_QUALITY` / `IMAGINE_COMPRESSION` | Ephemeral model defaults. |
@@ -331,8 +414,15 @@ For product images, use `normal` for copy/text layers, `multiply` for shadows,
 - `model 'X' not found`: run `imagine models`, or set `IMAGINE_MODEL` for ephemeral.
 - `no config` / ephemeral incomplete: set file via `config init`, or set
   `IMAGINE_BASE_URL` + `IMAGINE_MODEL` + `AZURE_OPENAI_APIKEY`.
-- `missing credential`: set `AZURE_OPENAI_APIKEY`, `IMAGINE_API_KEY`, or endpoint `api_key`.
+- `missing credential`: set the env named in the message (`ARK_API_KEY`,
+  `GEMINI_API_KEY`, `AZURE_OPENAI_APIKEY`), `IMAGINE_API_KEY`, or endpoint
+  `api_key`.
 - `HTTP 4xx/5xx`: the error comes from the provider API, such as policy,
   quota, or authentication failures.
+- Video `task <id> did not finish within <n>s`: the clip is still generating
+  upstream. Raise `--timeout` (or `task_timeout`) and/or `--poll-interval`.
+- Video `task <id> failed: …`: the provider rejected or blocked the output
+  (content policy, expired task) — change the prompt; retrying unchanged will
+  fail again.
 - Slow generation or rate limits: configure multiple `endpoints` for the model
   and increase `-c`.

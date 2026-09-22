@@ -5,19 +5,22 @@
 
 ## 1. 项目目标
 
-`imagine` 是一个**通用图像生成 CLI**，为 AI agent 调用而设计。核心目标：
+`imagine` 是一个**通用图像/视频生成 CLI**，为 AI agent 调用而设计。核心目标：
 
-- **统一前端参数**：调用方只关心 prompt、尺寸、数量等通用参数，不关心后端差异。
+- **统一前端参数**：调用方只关心 prompt、尺寸、时长、首帧等通用参数，不关心后端差异。
 - **按模型名路由后端**：通过 `-m <model>` 在配置中查到 `backend`，分发到对应实现。
 - **多后端、可扩展**：新增模型 = 新增一个 body builder + 注册一行，不改动调用方。
+- **内置视频能力**：Seedance（火山方舟）与 Gemini Omni（Interactions API）为编译进二进制的后端，
+  同步/异步差异由后端声明的 flow 决定；密钥只从环境变量取（`ARK_API_KEY` / `GEMINI_API_KEY`）。
 - **同模型多端点并发**：一个模型可配置多个 `endpoints`（不同 URL/KEY），调度器并发分摊请求。
 - **agent 友好**：`--json` 输出机器可解析结果；`--dry-run` 只打印请求体；退出码区分成功/失败/用法错误。
-- **单一静态二进制**：纯 Zig + `std.http.Client`，不依赖 curl/jq/base64 等外部命令。
+- **单一静态二进制**：纯 Zig + `std.http.Client`，不依赖 curl/jq/base64/ffmpeg 等外部命令。
 
 ## 2. 边界（不做什么）
 
 - **不是**长驻服务 / HTTP server，也**不是**库；它是一次性 CLI 进程。
-- **不做**图像后处理（裁剪、放大、格式转换链路）——只负责"调用模型 → 落盘原图"。
+- **不做**图像/视频后处理（裁剪、放大、转码、拼接、加水印）——只负责"调用模型 → 落盘原始产物"。
+- **不托管**回调：异步任务用轮询（`--poll-interval`/`--timeout`）等待，不注册 webhook。
 - **不内置**模型权重或本地推理；只对接 HTTP 模型服务。本地模型（如 Qwen-Image-2.1）
   由 `integrations/` 下的独立 server 进程托管，二进制里没有任何模型代码。
 - **不管理**密钥分发；密钥来自环境变量或配置文件，由调用环境负责。
@@ -25,32 +28,50 @@
 
 ## 3. 架构（src/）
 
-数据流：`main → config → backend(dispatch) → backends/* (build body) → http → 解析 → scheduler 落盘`
+数据流（同步后端）：`main → config → backend(dispatch) → backends/* (build body) → http → 解析 → scheduler 落盘`
+
+数据流（异步视频后端）：`... → POST 建任务 → parseCreate → 轮询 pollUrl → parsePoll → 下载 → scheduler 落盘`
 
 | 模块 | 职责 | 不应该做的事 |
 |------|------|--------------|
 | `version.zig` | 版本常量 | — |
-| `types.zig` | 核心解耦类型：`ImageRequest`/`Endpoint`/`ModelConfig`/`BackendKind`/`AuthScheme` | 不含 IO / 网络 |
-| `util.zig` | base64 解码、`~` 展开、扩展名、时间戳、key 脱敏、路径数字后缀 | 不含业务逻辑 |
-| `config.zig` | 解析 JSON 配置、解析路径、`template`、`Env` 接口、从 env 取 key | 不直接读 `std.process`（通过 `Env` vtable 注入，便于测试） |
+| `types.zig` | 核心解耦类型：`GenRequest`/`InputImage`/`Endpoint`/`ModelConfig`/`BackendKind`/`AuthScheme`，以及后端路由元数据（`media()`/`flow()`/`defaultKeyEnv()`/`assetNeedsAuth()`） | 不含 IO / 网络 |
+| `util.zig` | base64 编解码、MIME 推断、`~` 展开、扩展名、时间戳、key 脱敏、路径数字后缀 | 不含业务逻辑 |
+| `config.zig` | 解析 TOML/JSON 配置、解析路径、`template`、`Env` 接口、从 env 取 key、挂载内置 presets | 不直接读 `std.process`（通过 `Env` vtable 注入，便于测试） |
+| `presets.zig` | 内置模型预设（Ark Seedream/Seedance、Gemini Omni 的 URL + model id + 凭证 env），纯数据 | 不含逻辑；配置同名模型优先 |
+| `wire.zig` | 共享 wire 辅助：异步任务结果类型（`TaskOutcome`/`PollOutcome`）、错误信封解析（`rootObject`/`apiError`，兼容数组包裹） | 不含 provider 语义、不做 IO（让 `backends/*` 不必反向依赖 `backend.zig`） |
 | `http.zig` | `std.http.Client` 薄封装：`post`/`get` → `Response{status,body}` | 不懂任何模型语义 |
 | `backends/openai_image.zig` | OpenAI-compatible `/v1/images/generations` 请求体（`size` 字符串） | 只构造 body，不发请求 |
 | `backends/azure_flux.zig` | Azure FLUX 请求体（`width`/`height`，可选 `seed`） | 同上 |
 | `backends/qwen_image.zig` | Qwen-Image 请求体（`size` 像素串或原生比例 token、`steps`、`seed`），调本地/自托管 server | 同上 |
-| `backend.zig` | 后端注册 + `generate()` 编排 + 共享响应解析（b64_json / url 回退 / error） | 不解析 CLI、不写文件 |
-| `scheduler.zig` | 并发任务执行（`std.Thread` 原子认领）、落盘、进度上报 | 不构造请求体、不解析 CLI |
+| `backends/volcengine_image.zig` | 火山方舟 Seedream 请求体（`size` 档位或像素、`watermark`、`image` 参考图；无 `n`/`seed`） | 同上 |
+| `backends/seedance.zig` | 火山方舟 Seedance 建任务体 + `parseCreate`/`pollUrl`/`parsePoll`（`content[]`、`status` 终态判定） | 不发起请求、不下载 |
+| `backends/gemini_video.zig` | Gemini Interactions API（Omni）建任务体 + 三个解析器（`steps[].content[].uri`、Files `state`、下载 URL） | 同上 |
+| `backend.zig` | 后端注册 + `generate()` 编排（同步 / 异步建任务-轮询-下载）+ 共享响应解析（b64_json / url 回退 / error）+ 凭证头 | 不解析 CLI、不写文件 |
+| `scheduler.zig` | 并发任务执行（`std.Thread` 原子认领）、落盘、进度上报、异步任务的 poll/timeout 传递 | 不构造请求体、不解析 CLI |
 | `cli.zig` | 参数解析 + help 文本 | 不发网络请求 |
-| `main.zig` | 入口 `main(init: std.process.Init)`、子命令分发、结果渲染 | 业务细节下沉到各模块 |
+| `main.zig` | 入口 `main(init: std.process.Init)`、子命令分发、`--image` 读盘/下载、结果渲染 | 业务细节下沉到各模块 |
 
 **唯一做进程级 IO（env/args/stdout）的是 `main.zig`**；其余模块通过参数/接口注入依赖，保持可测试、可解耦。
 
 ### 新增一个后端的步骤
-1. 在 `types.zig` 的 `BackendKind` 增加变体（及 `fromString` 别名）。
-2. 在 `src/backends/` 新增 `your_provider.zig`，实现 `buildBody(arena, req, api_model) ![]u8`。
-3. 在 `backend.zig` 的 `buildBody` dispatch 增加一个 switch 分支。
-4. 若响应结构不同，扩展 `parseResponse`（当前支持 `data[].b64_json` 与 `data[].url`）。
-5. 加单元测试（body 形状）；更新 `config.template` 与 README/SKILL 文档。
-6. 若后端依赖自托管服务（如 `qwen_image`），在 `integrations/<backend>/` 放
+1. 在 `types.zig` 的 `BackendKind` 增加变体（及 `fromString` 别名），并补齐路由元数据：
+   `media()`、`flow()`、`defaultKeyEnv()`、`assetNeedsAuth()`、`inputImageStyle()`
+   （`unsupported` 表示该后端不接受 `--image`，CLI 会直接报用法错误而不是静默忽略）。
+2. 在 `src/backends/` 新增 `your_provider.zig`，实现 `buildBody(allocator, req) ![]u8`
+   （异步后端这里就是"建任务"体）。
+3. 在 `backend.zig` 的 `buildBody` dispatch 增加一个 switch 分支；
+   若是异步后端，再在 `asyncImpl` 里登记 `parseCreate`/`pollUrl`/`parsePoll`
+   （两处 switch 都是穷尽式，漏了编译不过）。
+4. 同步后端若响应结构不同，扩展 `parseResponse`（当前支持 `data[].b64_json` 与
+   `data[].url`，Seedream 复用同一形状）；异步后端在 `parsePoll` 里把终态映射成
+   `done`/`api_error`，注意"HTTP 200 + status=failed"这类 provider 语义。
+   解析器返回 `wire.TaskOutcome`/`wire.PollOutcome`，错误文案统一走 `wire.apiError`
+   （它能识别 `{error:{…}}` 与 `[{error:{…}}]` 两种信封）。
+5. 加单元测试（body 形状 + 解析器：pending/done/error 三条路径）；
+   更新 `config.template`、`config.example.toml` 与 README/SKILL 文档。
+6. 若是第一方 provider 的常用模型，在 `presets.zig` 加一条预设（纯数据，无新代码路径）。
+7. 若后端依赖自托管服务（如 `qwen_image`），在 `integrations/<backend>/` 放
    server + 安装脚本 + README：服务端契约、安装、硬件要求与排障集中一处说明。
 
 ## 4. 配置 schema（`~/.imagine/config.toml`）
@@ -60,17 +81,21 @@
 ```toml
 output_dir = "~/.imagine/outputs"
 concurrency = 0 # 0=按端点数自动；>0 固定并发
+poll_interval = 5 # 异步（视频）任务轮询间隔秒数
+task_timeout = 600 # 单个异步任务的等待上限秒数
 
-# 表键即 -m 的逻辑名，可自由增删改；模型名不写死在二进制里。
+# 表键即 -m 的逻辑名，可自由增删改；逻辑名不写死在二进制里。
 [models."<model-name>"]
-backend = "openai_image" # openai_image | azure_flux | qwen_image（azure_image 为兼容别名）
+backend = "openai_image" # openai_image | azure_flux | qwen_image
+                         # | volcengine_image | seedance | gemini_video
+                         #（azure_image 为兼容别名）
 api_model = "传给 API 的真实 model 字段"
 
 [[models."<model-name>".endpoints]]
-base_url = "https://.../images/generations"
+base_url = "https://.../images/generations" # 异步后端填"建任务"URL
 api_key_env = "AZURE_OPENAI_APIKEY" # 从环境变量取 key
 api_key = "可选：直接写死 key（优先于 env）"
-auth = "bearer" # bearer | api-key | none（none = 本地无鉴权端点），默认 bearer
+auth = "bearer" # bearer | api-key | google_api_key | none（none = 本地无鉴权端点）
 
 [models."<model-name>".defaults]
 size = "1024x1024"
@@ -80,10 +105,36 @@ output_format = "png"
 output_compression = 100
 quality = "high"
 steps = 40 # qwen_image：num_inference_steps
+duration = 5 # 视频：秒
+resolution = "720p" # 视频：480p | 720p | 1080p | 4k
+ratio = "16:9" # 视频：宽高比 token
+watermark = false # 火山方舟：图像默认 true，视频默认 false
 ```
 
 参数优先级：**CLI 选项 > 模型 `defaults` > 内置缺省**。
 密钥优先级：端点 `api_key` > 端点 `api_key_env` 指向的环境变量。
+异步任务等待优先级：`--poll-interval`/`--timeout` > `poll_interval`/`task_timeout` > 内置缺省。
+
+### 后端路由元数据（写在 `types.zig` 的 `BackendKind` 上）
+
+| 方法 | 含义 |
+|------|------|
+| `media()` | `image` / `video`：决定默认扩展名（png/mp4）与 `--json` 落到哪个数组 |
+| `flow()` | `sync`（一次请求出结果）/ `async_task`（建任务→轮询→下载） |
+| `defaultKeyEnv()` | ephemeral 模式未指定 `IMAGINE_API_KEY_ENV` 时的凭证 env（Ark→`ARK_API_KEY`、Gemini→`GEMINI_API_KEY`，其余→`AZURE_OPENAI_APIKEY`） |
+| `assetNeedsAuth()` | 产物 URL 是否必须带凭证下载（Gemini Files 需要；Ark/Azure 的预签名 URL 不能带，Azure 会因 SAS + Authorization 同时出现而拒绝） |
+| `inputImageStyle()` | 统一 `--image` 如何传给 provider：`url_or_data_url` / `bytes_base64` |
+
+### 内置 presets（`presets.zig`）
+
+`ARK_API_KEY` / `GEMINI_API_KEY` 就位后，无需任何配置文件即可调用内置模型
+（`imagine models` 里 `source = "preset"`）：Seedance 视频 3 个、Seedream 图像 2 个、
+Gemini Omni 视频 1 个。规则：
+
+- 配置文件里同名模型**永远优先**（可覆盖 URL / `api_model` / defaults / 多端点）；
+- 预设只提供 URL、model id、凭证 env，不提供 defaults，也不含任何密钥；
+- provider 的 model id 会过期，预设按"当前可用"维护，不做历史兼容；
+- 无配置文件且无 ephemeral env 时，配置来源标记为 `source = "preset"`。
 
 ### 无配置文件（ephemeral）
 
@@ -91,36 +142,64 @@ steps = 40 # qwen_image：num_inference_steps
 
 | 变量 | 含义 |
 |------|------|
-| `IMAGINE_BASE_URL` | 必填，images endpoint |
+| `IMAGINE_BASE_URL` | 必填，endpoint（异步后端填建任务 URL） |
 | `IMAGINE_MODEL` | 必填，逻辑名（兼默认 api_model） |
-| `AZURE_OPENAI_APIKEY` / `IMAGINE_API_KEY` / `IMAGINE_API_KEY_ENV` | 凭证 |
+| `AZURE_OPENAI_APIKEY` / `IMAGINE_API_KEY` / `IMAGINE_API_KEY_ENV` | 凭证；默认 env 随 `IMAGINE_BACKEND` 变化（Ark→`ARK_API_KEY`、Gemini→`GEMINI_API_KEY`） |
 | `IMAGINE_BACKEND` / `IMAGINE_AUTH` / `IMAGINE_API_MODEL` / `IMAGINE_SIZE` / `IMAGINE_STEPS`… | 可选 |
+| `IMAGINE_DURATION` / `IMAGINE_RESOLUTION` / `IMAGINE_RATIO` / `IMAGINE_WATERMARK` / `IMAGINE_POLL_INTERVAL` / `IMAGINE_TASK_TIMEOUT` | 可选（视频参数与异步等待） |
 
 `IMAGINE_AUTH=none` 表示本地无鉴权端点（如 `qwen_image`），此时无需任何凭证。
 
-`imagine models` / `config show` 的 `source` 为 `ephemeral` 或 `file`。仅一个模型时可省略 `-m`。多模型/多端点仍用配置文件。
+`imagine models` / `config show` 的 `source` 为 `file`、`ephemeral` 或 `preset`。
+仅一个模型时可省略 `-m`；多模型/多端点仍用配置文件。
+
+### 完全无配置（preset-only）
+
+配置文件与 ephemeral env 都不存在时，配置来源为 `preset`：`models` 为空、`presets` 为内置目录，
+`-m <preset 名>` 仍可直接生成（凭证从 env 取）。这是"内置支持 + 密钥用 env"的最短路径：
+
+```bash
+ARK_API_KEY=... imagine generate -m doubao-seedance-2-5-260628 -p "a fox" -o fox.mp4
+```
 
 ## 5. CLI 契约（对 agent 稳定）
 
 ```
 imagine generate -m <model> -p <prompt> [-o -n -s --width --height \
-        --format --compression --quality --seed --steps -c --config --json --dry-run -q]
-imagine batch <manifest.json> [-c --json]
+        --format --compression --quality --seed --steps \
+        --image --watermark/--no-watermark \
+        --duration --resolution --ratio --poll-interval --timeout \
+        -c --config --json --dry-run -q]
+imagine batch <manifest.json> [-c --poll-interval --timeout --json]
 imagine models [--json]
-imagine config path | init [--force] | show
+imagine config path | init [--force] | convert | show
 imagine version | help
 ```
 
 - 退出码：`0` 成功；`1` 运行失败（含部分失败）；`2` 用法错误。
-- `--json` 结果对象：`{ ok, model, backend, requested, succeeded, failed, images:[{path,bytes}], errors:[] }`。
-- batch manifest：`{ "jobs": [ { "model","prompt","output","size","width","height","n","format","compression","quality","seed","steps" } ] }`。
-- 多张图（`-n N` 或单端点）→ 文件名自动加 `-1 -2 …` 数字后缀。
+- `--json` 结果对象：
+  `{ ok, media, model, backend, requested, succeeded, failed, images:[{path,bytes}], videos:[{path,bytes}], errors:[] }`。
+  `media` = `image` | `video`，产物落在对应数组，另一个恒为空数组（形状稳定，便于 agent 解析）。
+- batch manifest 每个 job 额外支持 `duration`、`resolution`、`ratio`、`image`、`watermark`；
+  `--json` 的 `tasks[]` 每项带 `media`。
+- 多张图/多条视频 → 文件名自动加 `-1 -2 …` 数字后缀；`-n` 对视频是"发起 n 个 provider 任务"。
+- 异步后端把 provider 的失败（HTTP 200 + `status: failed`）如实转成 `errors[]` 文案，
+  例如 `task cgt-… failed: …`；超时报 `task <id> did not finish within <n>s`。
 
 ## 6. 路线图
 
 **已完成**
 - 核心架构（types/config/http/backend/scheduler/cli/main）与单元测试。
 - OpenAI 兼容 `openai_image`（`/v1/images/generations`）与 Azure `azure_flux`。
+- **视频生成（异步任务）**：`seedance`（火山方舟 `contents/generations/tasks`：建任务 →
+  轮询 `status` → 下载 `content.video_url`）与 `gemini_video`（Gemini Interactions API /
+  Omni：`steps[].content[].uri` → Files `state` → `:download?alt=media`）。统一参数
+  `--duration/--resolution/--ratio/--image`，`--poll-interval/--timeout` 与
+  `poll_interval/task_timeout` 控制等待；`media()`/`flow()` 元数据决定默认扩展名与 `--json` 形状。
+- **火山方舟生图**：`volcengine_image`（Seedream：`size` 档位或像素、`watermark`、
+  `image` 参考图；无 `n`/`seed`，响应复用 OpenAI `data[]` 形状）。
+- **内置 presets**（`presets.zig`）：Ark Seedance ×3 / Seedream ×2、Gemini Omni ×1；
+  仅凭 `ARK_API_KEY` / `GEMINI_API_KEY` 即可无配置文件调用，`imagine models` 标注 `source=preset`。
 - 模型名由配置动态声明；`imagine models` 发现可用模型。默认密钥 env：`AZURE_OPENAI_APIKEY`。
 - **Ephemeral 无配置文件模式**：无文件时用 `IMAGINE_BASE_URL` + `IMAGINE_MODEL` + 凭证合成单模型；`source` 标注；单模型可省略 `-m`。
 - 同模型多端点并发调度；`--json`/`--dry-run`/batch；config init/show/path。
@@ -138,10 +217,14 @@ imagine version | help
   vLLM-Omni 的 `/v1/images/generations`。
 
 **近期**
-- HTTP 超时与有界重试（指数退避，仅幂等失败）。
+- HTTP 超时与有界重试（指数退避，仅幂等失败）；异步任务当前"失败即上报、不重试"。
+- Veo（`generateContent` + `:predictLongRunning`）——与 Omni 的 Interactions API 是两套
+  协议，需要独立后端，暂未接入。
 - 更多后端：Google Gemini 图像、Stability、Replicate。
 - 图生图 / 编辑（input image、mask）参数通路；`integrations/qwen-image` 的 server 已
   支持 `image`/`images`，CLI 参数补齐后即可直接接上 Qwen-Image-2.1 的编辑能力。
+- 视频续写/编辑（Omni 的 `previous_interaction_id`、Seedance 的 `last_frame`）、
+  异步任务的 webhook（`callback_url`）与本地任务缓存（同 id 断点续传）。
 
 **远期**
 - 速率限制感知调度（按端点配额）、流式进度、结构化日志。
@@ -149,8 +232,11 @@ imagine version | help
 ## 7. 开发约定
 
 - 目标 Zig 版本：见 `build.zig.zon` 的 `minimum_zig_version`（当前 **0.16.0**）。
-- 常用命令：`make build` / `make test` / `make run` / `make install` / `make fmt`。
+- 常用命令：`make build` / `make test` / `make e2e` / `make run` / `make install` / `make fmt`。
 - 提交前：`zig build test` 必须通过；`zig fmt src/*.zig` 保持格式。
+- 单元测试覆盖 body 形状与解析器；**HTTP 编排（建任务→轮询→下载、落盘、`--json`）由
+  `scripts/e2e.sh` 验证**，它用 `scripts/mock_providers.py`（Ark / Gemini 的本地替身，
+  按文档 wire format 实现，只验证 imagine 侧）跑真实客户端路径，不需要网络与密钥。
 - 保持模块单一职责与上表边界；新增后端遵循 §3 步骤。
 - 注释只解释"为什么"，不复述"做什么"。
 

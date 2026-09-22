@@ -14,6 +14,63 @@ pub fn base64DecodeAlloc(allocator: std.mem.Allocator, src: []const u8) ![]u8 {
     return out;
 }
 
+/// Encode bytes as standard base64 (no line breaks). Providers that take an
+/// inline image want either this or a `data:` URL built from it.
+pub fn base64EncodeAlloc(allocator: std.mem.Allocator, bytes: []const u8) ![]const u8 {
+    const enc = std.base64.standard.Encoder;
+    const out = try allocator.alloc(u8, enc.calcSize(bytes.len));
+    errdefer allocator.free(out);
+    return enc.encode(out, bytes);
+}
+
+/// MIME type for an image path, by extension. Defaults to `image/png`, which is
+/// what every provider accepts when the type is unknown.
+pub fn mimeForPath(path: []const u8) []const u8 {
+    if (std.ascii.endsWithIgnoreCase(path, ".jpg") or std.ascii.endsWithIgnoreCase(path, ".jpeg"))
+        return "image/jpeg";
+    if (std.ascii.endsWithIgnoreCase(path, ".webp")) return "image/webp";
+    if (std.ascii.endsWithIgnoreCase(path, ".gif")) return "image/gif";
+    if (std.ascii.endsWithIgnoreCase(path, ".bmp")) return "image/bmp";
+    return "image/png";
+}
+
+/// True when `s` is an http(s) URL rather than a local path.
+pub fn isHttpUrl(s: []const u8) bool {
+    return std.ascii.startsWithIgnoreCase(s, "http://") or std.ascii.startsWithIgnoreCase(s, "https://");
+}
+
+/// A `data:` URL carrying `bytes` inline — how providers that accept images in a
+/// JSON body take a local file.
+pub fn dataUrlAlloc(allocator: std.mem.Allocator, bytes: []const u8, mime: []const u8) ![]const u8 {
+    const b64 = try base64EncodeAlloc(allocator, bytes);
+    defer allocator.free(b64);
+    return std.fmt.allocPrint(allocator, "data:{s};base64,{s}", .{ mime, b64 });
+}
+
+/// True for `W:H` tokens such as `16:9` (as opposed to a pixel size). Video
+/// backends read `--size` as an aspect ratio, since pixels have no meaning there.
+pub fn isRatio(s: []const u8) bool {
+    const colon = std.mem.indexOfScalar(u8, s, ':') orelse return false;
+    if (colon == 0 or colon + 1 >= s.len) return false;
+    for (s[0..colon]) |c| if (!std.ascii.isDigit(c)) return false;
+    for (s[colon + 1 ..]) |c| if (!std.ascii.isDigit(c)) return false;
+    return true;
+}
+
+/// MIME type from the file's magic bytes, or null when it is not a recognised
+/// image. Providers reject an inline image whose declared type disagrees with
+/// its bytes, and a URL (or a misnamed file) often carries no usable extension,
+/// so the bytes are the more trustworthy source.
+pub fn sniffImageMime(bytes: []const u8) ?[]const u8 {
+    if (std.mem.startsWith(u8, bytes, "\x89PNG\r\n")) return "image/png";
+    if (std.mem.startsWith(u8, bytes, "\xff\xd8\xff")) return "image/jpeg";
+    if (std.mem.startsWith(u8, bytes, "GIF8")) return "image/gif";
+    if (std.mem.startsWith(u8, bytes, "BM")) return "image/bmp";
+    if (bytes.len >= 12 and std.mem.startsWith(u8, bytes, "RIFF") and
+        std.mem.eql(u8, bytes[8..12], "WEBP")) return "image/webp";
+    return null;
+}
+
 /// Expand a leading `~` to the user's home directory. Returns a newly allocated
 /// path. If `path` does not start with `~`, it is duplicated unchanged.
 pub fn expandTilde(allocator: std.mem.Allocator, home: ?[]const u8, path: []const u8) ![]u8 {
@@ -104,6 +161,48 @@ test "base64 decode" {
     const out = try base64DecodeAlloc(std.testing.allocator, "aGVsbG8=");
     defer std.testing.allocator.free(out);
     try std.testing.expectEqualStrings("hello", out);
+}
+
+test "base64 encode round trips" {
+    const a = std.testing.allocator;
+    const enc = try base64EncodeAlloc(a, "hello");
+    defer a.free(enc);
+    try std.testing.expectEqualStrings("aGVsbG8=", enc);
+    const dec = try base64DecodeAlloc(a, enc);
+    defer a.free(dec);
+    try std.testing.expectEqualStrings("hello", dec);
+}
+
+test "isRatio distinguishes ratio tokens from pixel sizes" {
+    try std.testing.expect(isRatio("16:9"));
+    try std.testing.expect(isRatio("1:1"));
+    try std.testing.expect(!isRatio("1024x1024"));
+    try std.testing.expect(!isRatio("2K"));
+    try std.testing.expect(!isRatio(":9"));
+    try std.testing.expect(!isRatio("16:"));
+}
+
+test "dataUrlAlloc wraps base64 in a data URL" {
+    const url = try dataUrlAlloc(std.testing.allocator, "hi", "image/jpeg");
+    defer std.testing.allocator.free(url);
+    try std.testing.expectEqualStrings("data:image/jpeg;base64,aGk=", url);
+}
+
+test "sniffImageMime reads magic bytes" {
+    try std.testing.expectEqualStrings("image/png", sniffImageMime("\x89PNG\r\n\x1a\n").?);
+    try std.testing.expectEqualStrings("image/jpeg", sniffImageMime("\xff\xd8\xff\xe0").?);
+    try std.testing.expectEqualStrings("image/webp", sniffImageMime("RIFF\x00\x00\x00\x00WEBPVP8 ").?);
+    try std.testing.expectEqualStrings("image/gif", sniffImageMime("GIF89a").?);
+    try std.testing.expect(sniffImageMime("not an image") == null);
+    try std.testing.expect(sniffImageMime("") == null);
+}
+
+test "mimeForPath and isHttpUrl" {
+    try std.testing.expectEqualStrings("image/jpeg", mimeForPath("a/b.JPG"));
+    try std.testing.expectEqualStrings("image/webp", mimeForPath("x.webp"));
+    try std.testing.expectEqualStrings("image/png", mimeForPath("x.heic"));
+    try std.testing.expect(isHttpUrl("https://example.com/a.png"));
+    try std.testing.expect(!isHttpUrl("./a.png"));
 }
 
 test "expandTilde" {

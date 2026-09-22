@@ -1,10 +1,17 @@
 # Global defaults. output_dir is used when --output is omitted; concurrency = 0
 # means auto-select based on the selected model's endpoint count.
 #
+# poll_interval / task_timeout bound asynchronous (video) tasks: how often to ask
+# the provider for the task status, and how long to wait before giving up.
+#
 # Model names are dynamic: the table key under [models."..."] is what you pass
-# to `-m` / `"model"` in batch jobs. Prefer `imagine models` to discover them.
+# to `-m` / `"model"` in batch jobs. Prefer `imagine models` to discover them —
+# it also lists the built-in presets (Volcengine Ark, Google Gemini), which work
+# without any config file once their API key is in the environment.
 output_dir = "~/.imagine/outputs"
 concurrency = 0
+poll_interval = 5
+task_timeout = 600
 
 [models."MAI-Image-2.6"]
 backend = "openai_image"
@@ -56,6 +63,50 @@ size = "1024x1024"
 output_format = "png"
 output_compression = 100
 quality = "high"
+
+# --- Volcengine Ark: Seedance video + Seedream images (optional) -------------
+# Credential env: ARK_API_KEY. Both models are built-in presets too, so this
+# block only matters when overriding a URL, pinning defaults, or adding a
+# second endpoint.
+# [models."doubao-seedance-2-5-260628"]
+# backend = "seedance"           # async: imagine creates the task and polls it
+# api_model = "doubao-seedance-2-5-260628"
+#
+# [[models."doubao-seedance-2-5-260628".endpoints]]
+# base_url = "https://ark.cn-beijing.volces.com/api/v3/contents/generations/tasks"
+# api_key_env = "ARK_API_KEY"
+#
+# [models."doubao-seedance-2-5-260628".defaults]
+# duration = 5                   # seconds
+# resolution = "720p"            # 480p | 720p | 1080p | 4k
+# ratio = "16:9"
+#
+# [models."doubao-seedream-5-0-260128"]
+# backend = "volcengine_image"   # sync
+# api_model = "doubao-seedream-5-0-260128"
+#
+# [[models."doubao-seedream-5-0-260128".endpoints]]
+# base_url = "https://ark.cn-beijing.volces.com/api/v3/images/generations"
+# api_key_env = "ARK_API_KEY"
+#
+# [models."doubao-seedream-5-0-260128".defaults]
+# size = "2K"                    # tier (1K/2K/4K) or explicit WxH
+# watermark = false              # Ark defaults to true for images
+
+# --- Google Gemini video: Omni via the Interactions API (optional) -----------
+# Credential env: GEMINI_API_KEY, sent as the `x-goog-api-key` header.
+# [models."gemini-omni-1.1-flash"]
+# backend = "gemini_video"       # async: imagine creates the interaction,
+# api_model = "gemini-omni-1.1-flash"   # polls the Files API, then downloads
+#
+# [[models."gemini-omni-1.1-flash".endpoints]]
+# base_url = "https://generativelanguage.googleapis.com/v1beta/interactions"
+# api_key_env = "GEMINI_API_KEY"
+# auth = "google_api_key"
+#
+# [models."gemini-omni-1.1-flash".defaults]
+# resolution = "720p"
+# ratio = "16:9"
 
 # --- Local Qwen-Image-2.1 (optional) -----------------------------------------
 # Install the local server first (see integrations/qwen-image/README.md):

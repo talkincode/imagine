@@ -44,7 +44,7 @@ fn aspectRatioSize(s: []const u8) ?AspectRatio {
 /// Unified `--size` / `--width`+`--height` -> `WIDTHxHEIGHT`, or null to let
 /// the server apply its own default (2048x2048). Derived strings live in the
 /// caller's `buf`, so building a body needs no allocation of its own.
-fn resolveSize(buf: []u8, req: types.ImageRequest) ?[]const u8 {
+fn resolveSize(buf: []u8, req: types.GenRequest) ?[]const u8 {
     if (req.size) |s| {
         if (aspectRatioSize(s)) |ar| {
             return std.fmt.bufPrint(buf, "{d}x{d}", .{ ar.width, ar.height }) catch null;
@@ -57,7 +57,7 @@ fn resolveSize(buf: []u8, req: types.ImageRequest) ?[]const u8 {
     return null;
 }
 
-pub fn buildBody(allocator: std.mem.Allocator, req: types.ImageRequest) ![]u8 {
+pub fn buildBody(allocator: std.mem.Allocator, req: types.GenRequest) ![]u8 {
     const Body = struct {
         model: []const u8,
         prompt: []const u8,
@@ -89,7 +89,7 @@ pub fn buildBody(allocator: std.mem.Allocator, req: types.ImageRequest) ![]u8 {
 
 test "qwen_image maps an aspect-ratio token to native 2K size" {
     const a = std.testing.allocator;
-    const req = types.ImageRequest{ .prompt = "a fox", .api_model = "Qwen/Qwen-Image-2.1", .size = "16:9" };
+    const req = types.GenRequest{ .prompt = "a fox", .api_model = "Qwen/Qwen-Image-2.1", .size = "16:9" };
     const body = try buildBody(a, req);
     defer a.free(body);
     try std.testing.expect(std.mem.indexOf(u8, body, "\"size\":\"2752x1536\"") != null);
@@ -97,7 +97,7 @@ test "qwen_image maps an aspect-ratio token to native 2K size" {
 
 test "qwen_image passes an explicit size through" {
     const a = std.testing.allocator;
-    const req = types.ImageRequest{ .prompt = "x", .api_model = "m", .size = "1024x768" };
+    const req = types.GenRequest{ .prompt = "x", .api_model = "m", .size = "1024x768" };
     const body = try buildBody(a, req);
     defer a.free(body);
     try std.testing.expect(std.mem.indexOf(u8, body, "\"size\":\"1024x768\"") != null);
@@ -105,7 +105,7 @@ test "qwen_image passes an explicit size through" {
 
 test "qwen_image derives size from width/height" {
     const a = std.testing.allocator;
-    const req = types.ImageRequest{ .prompt = "x", .api_model = "m", .width = 512, .height = 768 };
+    const req = types.GenRequest{ .prompt = "x", .api_model = "m", .width = 512, .height = 768 };
     const body = try buildBody(a, req);
     defer a.free(body);
     try std.testing.expect(std.mem.indexOf(u8, body, "\"size\":\"512x768\"") != null);
@@ -113,7 +113,7 @@ test "qwen_image derives size from width/height" {
 
 test "qwen_image sends steps/seed/format and omits nulls" {
     const a = std.testing.allocator;
-    const req = types.ImageRequest{
+    const req = types.GenRequest{
         .prompt = "x",
         .api_model = "m",
         .n = 1,
@@ -135,7 +135,7 @@ test "qwen_image sends steps/seed/format and omits nulls" {
 
 test "qwen_image omits size/steps/seed when unset" {
     const a = std.testing.allocator;
-    const req = types.ImageRequest{ .prompt = "x", .api_model = "m" };
+    const req = types.GenRequest{ .prompt = "x", .api_model = "m" };
     const body = try buildBody(a, req);
     defer a.free(body);
     try std.testing.expect(std.mem.indexOf(u8, body, "size") == null);

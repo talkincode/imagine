@@ -7,7 +7,7 @@
 const std = @import("std");
 const types = @import("../types.zig");
 
-pub fn buildBody(allocator: std.mem.Allocator, req: types.ImageRequest) ![]u8 {
+pub fn buildBody(allocator: std.mem.Allocator, req: types.GenRequest) ![]u8 {
     // FLUX wants width/height. Derive them from a "WxH" size when needed.
     var width = req.width;
     var height = req.height;
@@ -43,7 +43,7 @@ pub fn buildBody(allocator: std.mem.Allocator, req: types.ImageRequest) ![]u8 {
 
 test "azure_flux body uses width/height and omits null seed" {
     const a = std.testing.allocator;
-    const req = types.ImageRequest{ .prompt = "a fox", .api_model = "FLUX.2-pro", .n = 1, .width = 1024, .height = 1024 };
+    const req = types.GenRequest{ .prompt = "a fox", .api_model = "FLUX.2-pro", .n = 1, .width = 1024, .height = 1024 };
     const body = try buildBody(a, req);
     defer a.free(body);
     try std.testing.expect(std.mem.indexOf(u8, body, "\"width\":1024") != null);
@@ -53,7 +53,7 @@ test "azure_flux body uses width/height and omits null seed" {
 
 test "azure_flux derives width/height from size" {
     const a = std.testing.allocator;
-    const req = types.ImageRequest{ .prompt = "x", .api_model = "FLUX.2-pro", .n = 1, .size = "768x512", .seed = 7 };
+    const req = types.GenRequest{ .prompt = "x", .api_model = "FLUX.2-pro", .n = 1, .size = "768x512", .seed = 7 };
     const body = try buildBody(a, req);
     defer a.free(body);
     try std.testing.expect(std.mem.indexOf(u8, body, "\"width\":768") != null);

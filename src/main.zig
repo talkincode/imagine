@@ -147,6 +147,10 @@ fn cmdConfigShow(ctx: Ctx, c: cli.Common) !u8 {
     var cfg = loadConfig(ctx, c.config_path) catch |e| return reportConfigError(ctx, e, c.config_path);
     defer cfg.deinit();
 
+    if (cfg.source == .preset) {
+        try printErr(ctx.io, "no config file found; showing built-in defaults (run 'imagine config init' to write one)\n");
+    }
+
     const Endpoint = struct {
         base_url: []const u8,
         auth: []const u8,
@@ -165,6 +169,8 @@ fn cmdConfigShow(ctx: Ctx, c: cli.Common) !u8 {
         config_path: ?[]const u8,
         output_dir: []const u8,
         concurrency: u32,
+        poll_interval: u32,
+        task_timeout: u32,
         models: []Model,
     };
 
@@ -198,9 +204,16 @@ fn cmdConfigShow(ctx: Ctx, c: cli.Common) !u8 {
         .config_path = cfg.source_path,
         .output_dir = cfg.output_dir,
         .concurrency = cfg.concurrency,
+        .poll_interval = cfg.poll_interval,
+        .task_timeout = cfg.task_timeout,
         .models = models,
     };
-    const json = try std.json.Stringify.valueAlloc(ctx.arena, show, .{ .whitespace = .indent_2 });
+    // Omit nulls: an unset optional is the common case and 11 nulls per model
+    // drown the values that are actually configured.
+    const json = try std.json.Stringify.valueAlloc(ctx.arena, show, .{
+        .whitespace = .indent_2,
+        .emit_null_optional_fields = false,
+    });
     try outf(ctx, "{s}\n", .{json});
     return 0;
 }
@@ -209,25 +222,51 @@ fn cmdModels(ctx: Ctx, c: cli.Common) !u8 {
     var cfg = loadConfig(ctx, c.config_path) catch |e| return reportConfigError(ctx, e, c.config_path);
     defer cfg.deinit();
 
+    // A preset whose name a configured model claims is unreachable, so it is
+    // not listed at all — `findPreset` resolves the same way.
+    var visible = std.ArrayList(types.ModelConfig).empty;
+    for (cfg.presets) |m| {
+        if (cfg.findModel(m.name) == null) try visible.append(ctx.arena, m);
+    }
+    const presets = visible.items;
+
     if (c.json) {
         const Item = struct {
             name: []const u8,
             backend: []const u8,
+            media: []const u8,
             api_model: []const u8,
             endpoints: usize,
             ready: bool,
             source: []const u8,
         };
-        var items = try ctx.arena.alloc(Item, cfg.models.len);
-        for (cfg.models, 0..) |m, i| {
+        var items = try ctx.arena.alloc(Item, cfg.models.len + presets.len);
+        var i: usize = 0;
+        for (cfg.models) |m| {
             items[i] = .{
                 .name = m.name,
                 .backend = m.backend.toString(),
+                .media = m.backend.media().toString(),
                 .api_model = m.api_model,
                 .endpoints = m.endpoints.len,
                 .ready = modelReady(m),
                 .source = cfg.source.toString(),
             };
+            i += 1;
+        }
+        // Presets are always listed so an agent can see what is callable with
+        // nothing but an API key; `source` tells them apart from real config.
+        for (presets) |m| {
+            items[i] = .{
+                .name = m.name,
+                .backend = m.backend.toString(),
+                .media = m.backend.media().toString(),
+                .api_model = m.api_model,
+                .endpoints = m.endpoints.len,
+                .ready = modelReady(m),
+                .source = "preset",
+            };
+            i += 1;
         }
         const json = try std.json.Stringify.valueAlloc(ctx.arena, items, .{ .whitespace = .indent_2 });
         try outf(ctx, "{s}\n", .{json});
@@ -237,7 +276,19 @@ fn cmdModels(ctx: Ctx, c: cli.Common) !u8 {
     try outf(ctx, "configured models ({d}, source={s}):\n", .{ cfg.models.len, cfg.source.toString() });
     for (cfg.models) |m| {
         const ready = if (modelReady(m)) "ready" else "no key";
-        try outf(ctx, "  {s:<16} backend={s:<12} endpoints={d} [{s}]\n", .{ m.name, m.backend.toString(), m.endpoints.len, ready });
+        try outf(ctx, "  {s:<28} backend={s:<17} endpoints={d} [{s}]\n", .{ m.name, m.backend.toString(), m.endpoints.len, ready });
+    }
+    if (presets.len > 0) {
+        try outf(ctx, "built-in presets ({d}, credential from env):\n", .{presets.len});
+        for (presets) |m| {
+            const ready = if (modelReady(m)) "ready" else "no key";
+            try outf(ctx, "  {s:<28} backend={s:<17} env={s} [{s}]\n", .{
+                m.name,
+                m.backend.toString(),
+                m.endpoints[0].api_key_env orelse "-",
+                ready,
+            });
+        }
     }
     return 0;
 }
@@ -262,7 +313,7 @@ fn cmdGenerate(ctx: Ctx, g: cli.Generate) !u8 {
 
     const model = (try resolveModel(ctx, &cfg, g.model)) orelse return 2;
 
-    var req = types.ImageRequest{
+    var req = types.GenRequest{
         .prompt = g.prompt.?,
         .api_model = model.api_model,
         .size = g.size,
@@ -274,16 +325,46 @@ fn cmdGenerate(ctx: Ctx, g: cli.Generate) !u8 {
         .quality = g.quality,
         .seed = g.seed,
         .steps = g.steps,
+        .duration = g.duration,
+        .resolution = g.resolution,
+        .ratio = g.ratio,
+        .watermark = g.watermark,
     };
     req.applyDefaults(model.defaults);
+    if (g.image != null and model.backend.inputImageStyle() == .unsupported) {
+        return reportUnsupportedImage(ctx, model.backend);
+    }
+    req.image = readInputImage(ctx, g.image) catch |e| switch (e) {
+        error.InputImageUnreadable => return 2,
+        else => return e,
+    };
 
-    if (g.dry_run) return dryRun(ctx, model, req, g.n);
+    if (g.dry_run) {
+        return dryRun(ctx, model, req, g.n, &cfg, g.poll_interval, g.timeout) catch |e| switch (e) {
+            error.DryRunBodyUnavailable => 2,
+            else => e,
+        };
+    }
 
-    // Resolve the output base path and extension.
-    const ext = util.extForFormat(req.output_format);
+    var client = std.http.Client{ .allocator = ctx.gpa, .io = ctx.io };
+    defer client.deinit();
+
+    // A first-frame URL is fetched here when the provider only takes bytes (a
+    // local file was already read above). This must happen before the tasks are
+    // built, because each task takes a copy of the request.
+    if (req.image) |img| {
+        req.image = backend.resolveInputImage(&client, ctx.arena, model.backend, img) catch {
+            try printErr(ctx.io, try std.fmt.allocPrint(ctx.arena, "cannot fetch --image '{s}' for backend {s}\n", .{ img.source, model.backend.toString() }));
+            return 1;
+        };
+    }
+
+    // Resolve the output base path and extension: a video model defaults to
+    // .mp4 while every image backend keeps its provider format.
+    const ext = backend.outputExt(model.backend, req.output_format);
     const base = try resolveOutputBase(ctx, &cfg, g.output, ext);
 
-    // Build one task per requested image, round-robining endpoints.
+    // Build one task per requested asset, round-robining endpoints.
     var tasks = try ctx.arena.alloc(scheduler.Task, g.n);
     for (0..g.n) |i| {
         const path = if (g.n == 1) base else try util.numberedPath(ctx.arena, base, i + 1);
@@ -297,12 +378,9 @@ fn cmdGenerate(ctx: Ctx, g: cli.Generate) !u8 {
     }
     defer for (tasks) |*t| t.arena.deinit();
 
-    var client = std.http.Client{ .allocator = ctx.gpa, .io = ctx.io };
-    defer client.deinit();
-
     const conc = chooseConcurrency(g.concurrency, cfg.concurrency, model.endpoints.len, g.n);
     if (!g.quiet and !g.common.json) {
-        try outf(ctx, "generating {d} image(s) with '{s}' across {d} endpoint(s), concurrency {d}\n", .{ g.n, model.name, model.endpoints.len, conc });
+        try outf(ctx, "generating {d} {s}(s) with '{s}' across {d} endpoint(s), concurrency {d}\n", .{ g.n, model.backend.media().toString(), model.name, model.endpoints.len, conc });
     }
 
     scheduler.run(tasks, .{
@@ -310,24 +388,103 @@ fn cmdGenerate(ctx: Ctx, g: cli.Generate) !u8 {
         .io = ctx.io,
         .client = &client,
         .progress = !g.quiet and !g.common.json,
+        .poll_interval_secs = g.poll_interval orelse cfg.poll_interval,
+        .timeout_secs = g.timeout orelse cfg.task_timeout,
     });
 
     return try renderResults(ctx, model, tasks, g.common.json);
 }
 
-fn dryRun(ctx: Ctx, model: *const types.ModelConfig, req: types.ImageRequest, n: u32) !u8 {
-    const body = try backend.buildBody(model.backend, ctx.arena, req);
+/// `--image` on a backend that takes no image input. Silently ignoring the file
+/// would let an agent believe the reference was used, so it is a usage error.
+fn reportUnsupportedImage(ctx: Ctx, kind: types.BackendKind) !u8 {
+    try printErr(ctx.io, try std.fmt.allocPrint(
+        ctx.arena,
+        "backend {s} takes no --image input (supported by: seedance, gemini_video, volcengine_image)\n",
+        .{kind.toString()},
+    ));
+    return 2;
+}
+
+/// The create body `--dry-run` prints. An inlined `--image` would put megabytes
+/// of base64 into that output, so its payload is replaced by its byte count;
+/// everything else is verbatim. A body that cannot be built without network
+/// access (a URL image for a bytes-only backend) is reported as a message
+/// instead of a Zig error trace.
+fn dryRunBody(ctx: Ctx, model: *const types.ModelConfig, req: types.GenRequest) ![]const u8 {
+    const body = backend.buildBody(model.backend, ctx.arena, req) catch |e| switch (e) {
+        error.OutOfMemory => return error.OutOfMemory,
+        error.InputImageNotFetched => {
+            try printErr(ctx.io, "this backend needs the --image bytes inline, but --dry-run makes no network call; pass a local file, or drop --dry-run to fetch the URL\n");
+            return error.DryRunBodyUnavailable;
+        },
+    };
+    const bytes = if (req.image) |img| (img.bytes orelse return body) else return body;
+    const b64 = try util.base64EncodeAlloc(ctx.arena, bytes);
+    const at = std.mem.indexOf(u8, body, b64) orelse return body;
+    const note = try std.fmt.allocPrint(ctx.arena, "<{d} bytes of base64 elided>", .{b64.len});
+    return std.fmt.allocPrint(ctx.arena, "{s}{s}{s}", .{ body[0..at], note, body[at + b64.len ..] });
+}
+
+/// Largest `--image` file read into memory. Ark caps a request body at 64 MB and
+/// a single image at 30 MB; 32 MB leaves room for the prompt and encoding.
+const max_input_image_bytes: usize = 32 * 1024 * 1024;
+
+/// `--image` accepts a path or an http(s) URL. Local files are read here so a
+/// typo fails before any provider request; URLs are left to the backend layer,
+/// which knows whether the provider takes URLs or raw bytes.
+fn readInputImage(ctx: Ctx, source: ?[]const u8) !?types.InputImage {
+    const raw = source orelse return null;
+    if (util.isHttpUrl(raw)) {
+        return types.InputImage{
+            .source = try ctx.arena.dupe(u8, raw),
+            .mime = util.mimeForPath(raw),
+        };
+    }
+    const path = try expandPath(ctx, raw);
+    const bytes = std.Io.Dir.cwd().readFileAlloc(ctx.io, path, ctx.arena, .limited(max_input_image_bytes)) catch |e| {
+        try printErr(ctx.io, try std.fmt.allocPrint(ctx.arena, "cannot read --image '{s}': {s}\n", .{ path, @errorName(e) }));
+        return error.InputImageUnreadable;
+    };
+    return types.InputImage{
+        .source = path,
+        .bytes = bytes,
+        // Magic bytes beat the extension: a misnamed file would otherwise be
+        // rejected by the provider for declaring the wrong type.
+        .mime = util.sniffImageMime(bytes) orelse util.mimeForPath(path),
+    };
+}
+
+fn dryRun(
+    ctx: Ctx,
+    model: *const types.ModelConfig,
+    req: types.GenRequest,
+    n: u32,
+    cfg: *const config.Config,
+    poll_interval: ?u32,
+    timeout: ?u32,
+) !u8 {
+    const body = try dryRunBody(ctx, model, req);
     const ep = &model.endpoints[0];
+    const media = model.backend.media();
     try outf(ctx,
         \\dry run (no API call)
         \\  model:    {s}
         \\  backend:  {s}
+        \\  media:    {s}
         \\  endpoint: {s}
-        \\  images:   {d}
+        \\  assets:   {d}
         \\  request body (n=1 per call):
         \\{s}
         \\
-    , .{ model.name, model.backend.toString(), ep.base_url, n, body });
+    , .{ model.name, model.backend.toString(), media.toString(), ep.base_url, n, body });
+    if (model.backend.flow() == .async_task) {
+        try outf(ctx,
+            \\  async: this backend creates a provider task and polls it
+            \\  poll:  every {d}s, giving up after {d}s (--poll-interval/--timeout)
+            \\
+        , .{ poll_interval orelse cfg.poll_interval, timeout orelse cfg.task_timeout });
+    }
     return 0;
 }
 
@@ -377,13 +534,16 @@ fn cmdBatch(ctx: Ctx, b: cli.Batch) !u8 {
             try printErr(ctx.io, "each job needs a 'model'\n");
             return 1;
         };
-        const model = cfg.findModel(model_name) orelse return reportUnknownModel(ctx, &cfg, model_name);
+        const model = cfg.findModel(model_name) orelse cfg.findPreset(model_name) orelse {
+            _ = try reportUnknownModel(ctx, &cfg, model_name);
+            return 2;
+        };
         const prompt = jsonStr(job, "prompt") orelse {
             try printErr(ctx.io, try std.fmt.allocPrint(ctx.arena, "job for model '{s}' needs a 'prompt'\n", .{model_name}));
             return 1;
         };
 
-        var req = types.ImageRequest{
+        var req = types.GenRequest{
             .prompt = try ctx.arena.dupe(u8, prompt),
             .api_model = model.api_model,
             .size = if (jsonStr(job, "size")) |s| try ctx.arena.dupe(u8, s) else null,
@@ -395,11 +555,22 @@ fn cmdBatch(ctx: Ctx, b: cli.Batch) !u8 {
             .quality = if (jsonStr(job, "quality")) |s| try ctx.arena.dupe(u8, s) else null,
             .seed = jsonI64(job, "seed"),
             .steps = jsonU32(job, "steps"),
+            .duration = jsonU32(job, "duration"),
+            .resolution = if (jsonStr(job, "resolution")) |s| try ctx.arena.dupe(u8, s) else null,
+            .ratio = if (jsonStr(job, "ratio")) |s| try ctx.arena.dupe(u8, s) else null,
+            .watermark = jsonBool(job, "watermark"),
         };
         req.applyDefaults(model.defaults);
+        if (jsonStr(job, "image") != null and model.backend.inputImageStyle() == .unsupported) {
+            return reportUnsupportedImage(ctx, model.backend);
+        }
+        req.image = readInputImage(ctx, jsonStr(job, "image")) catch |e| switch (e) {
+            error.InputImageUnreadable => return 2,
+            else => return e,
+        };
 
         const n = jsonU32(job, "n") orelse 1;
-        const ext = util.extForFormat(req.output_format);
+        const ext = backend.outputExt(model.backend, req.output_format);
         const base = if (jsonStr(job, "output")) |o|
             try expandPath(ctx, o)
         else
@@ -427,7 +598,10 @@ fn cmdBatch(ctx: Ctx, b: cli.Batch) !u8 {
     if (b.dry_run) {
         try outf(ctx, "dry run: {d} task(s) from manifest\n", .{task_slice.len});
         for (task_slice) |*t| {
-            const body = try backend.buildBody(t.model.backend, ctx.arena, t.req);
+            const body = dryRunBody(ctx, t.model, t.req) catch |e| switch (e) {
+                error.DryRunBodyUnavailable => return 2,
+                else => return e,
+            };
             try outf(ctx, "  {s} -> {s}\n    {s}\n", .{ t.model.name, t.output_path, body });
         }
         return 0;
@@ -435,6 +609,17 @@ fn cmdBatch(ctx: Ctx, b: cli.Batch) !u8 {
 
     var client = std.http.Client{ .allocator = ctx.gpa, .io = ctx.io };
     defer client.deinit();
+
+    // Same rule as `generate`: a first-frame URL is fetched only when the
+    // backend cannot take a URL directly.
+    for (task_slice) |*t| {
+        if (t.req.image) |img| {
+            t.req.image = backend.resolveInputImage(&client, ctx.arena, t.model.backend, img) catch {
+                try printErr(ctx.io, try std.fmt.allocPrint(ctx.arena, "cannot fetch --image '{s}' for backend {s}\n", .{ img.source, t.model.backend.toString() }));
+                return 1;
+            };
+        }
+    }
 
     const conc = chooseConcurrency(b.concurrency, cfg.concurrency, distinctEndpoints(task_slice), task_slice.len);
     if (!b.quiet and !b.common.json) {
@@ -446,6 +631,8 @@ fn cmdBatch(ctx: Ctx, b: cli.Batch) !u8 {
         .io = ctx.io,
         .client = &client,
         .progress = !b.quiet and !b.common.json,
+        .poll_interval_secs = b.poll_interval orelse cfg.poll_interval,
+        .timeout_secs = b.timeout orelse cfg.task_timeout,
     });
 
     return try renderBatchResults(ctx, task_slice, b.common.json);
@@ -583,34 +770,42 @@ fn renderResults(ctx: Ctx, model: *const types.ModelConfig, tasks: []scheduler.T
     const failed = tasks.len - ok_count;
 
     if (json) {
-        const ImageOut = struct { path: []const u8, bytes: usize };
-        var images = std.ArrayList(ImageOut).empty;
+        const AssetOut = struct { path: []const u8, bytes: usize };
+        var images = std.ArrayList(AssetOut).empty;
+        var videos = std.ArrayList(AssetOut).empty;
         var errors = std.ArrayList([]const u8).empty;
+        // Assets land under the key matching the model's media kind; the other
+        // array stays present (and empty) so the shape never changes.
+        const bucket = if (model.backend.media() == .video) &videos else &images;
         for (tasks) |*t| {
             if (t.ok()) {
-                for (t.written_paths) |p| try images.append(ctx.arena, .{ .path = p, .bytes = t.bytes_total });
+                for (t.written_paths) |p| try bucket.append(ctx.arena, .{ .path = p, .bytes = t.bytes_total });
             } else {
                 try errors.append(ctx.arena, t.err.?);
             }
         }
         const Result = struct {
             ok: bool,
+            media: []const u8,
             model: []const u8,
             backend: []const u8,
             requested: usize,
             succeeded: usize,
             failed: usize,
-            images: []ImageOut,
+            images: []AssetOut,
+            videos: []AssetOut,
             errors: [][]const u8,
         };
         const result = Result{
             .ok = failed == 0,
+            .media = model.backend.media().toString(),
             .model = model.name,
             .backend = model.backend.toString(),
             .requested = tasks.len,
             .succeeded = ok_count,
             .failed = failed,
             .images = try images.toOwnedSlice(ctx.arena),
+            .videos = try videos.toOwnedSlice(ctx.arena),
             .errors = try errors.toOwnedSlice(ctx.arena),
         };
         const out = try std.json.Stringify.valueAlloc(ctx.arena, result, .{ .whitespace = .indent_2 });
@@ -629,18 +824,32 @@ fn renderBatchResults(ctx: Ctx, tasks: []scheduler.Task, json: bool) !u8 {
     const failed = tasks.len - ok_count;
 
     if (json) {
-        const ImageOut = struct { model: []const u8, path: []const u8, bytes: usize, ok: bool, err: ?[]const u8 };
-        var items = try ctx.arena.alloc(ImageOut, tasks.len);
+        const TaskOut = struct {
+            model: []const u8,
+            media: []const u8,
+            path: []const u8,
+            bytes: usize,
+            ok: bool,
+            err: ?[]const u8,
+        };
+        var items = try ctx.arena.alloc(TaskOut, tasks.len);
         for (tasks, 0..) |*t, i| {
             const p = if (t.written_paths.len > 0) t.written_paths[0] else t.output_path;
-            items[i] = .{ .model = t.model.name, .path = p, .bytes = t.bytes_total, .ok = t.ok(), .err = t.err };
+            items[i] = .{
+                .model = t.model.name,
+                .media = t.model.backend.media().toString(),
+                .path = p,
+                .bytes = t.bytes_total,
+                .ok = t.ok(),
+                .err = t.err,
+            };
         }
         const Result = struct {
             ok: bool,
             total: usize,
             succeeded: usize,
             failed: usize,
-            tasks: []ImageOut,
+            tasks: []TaskOut,
         };
         const result = Result{ .ok = failed == 0, .total = tasks.len, .succeeded = ok_count, .failed = failed, .tasks = items };
         const out = try std.json.Stringify.valueAlloc(ctx.arena, result, .{ .whitespace = .indent_2 });
@@ -725,7 +934,9 @@ fn loadConfig(ctx: Ctx, explicit: ?[]const u8) !config.Config {
             if (config.ephemeralIntent(ctx.env)) {
                 return error.EphemeralIncomplete;
             }
-            return error.FileNotFound;
+            // 5) Nothing configured at all: built-in presets are still callable
+            //    with just their API key in the environment.
+            return config.loadPresetsOnly(ctx.gpa, ctx.env);
         };
     };
 }
@@ -743,10 +954,16 @@ fn resolveModel(ctx: Ctx, cfg: *config.Config, requested: ?[]const u8) !?*const 
             }
             return m;
         }
+        // Built-in presets are the last resort, so a config model always wins.
+        if (cfg.findPreset(name)) |m| return m;
         _ = try reportUnknownModel(ctx, cfg, name);
         return null;
     }
     if (cfg.models.len == 1) return &cfg.models[0];
+    if (cfg.models.len == 0 and cfg.presets.len > 0) {
+        try printErr(ctx.io, "missing required option: --model (nothing configured; pass a built-in preset name from `imagine models`)\n");
+        return null;
+    }
     try printErr(ctx.io, "missing required option: --model (multiple models configured; run `imagine models`)\n");
     return null;
 }
@@ -800,6 +1017,12 @@ fn reportUnknownModel(ctx: Ctx, cfg: *const config.Config, name: []const u8) !u8
     for (cfg.models) |m| {
         try printErr(ctx.io, try std.fmt.allocPrint(ctx.arena, "  {s}\n", .{m.name}));
     }
+    if (cfg.presets.len > 0) {
+        try printErr(ctx.io, "built-in presets (key from env):\n");
+        for (cfg.presets) |m| {
+            try printErr(ctx.io, try std.fmt.allocPrint(ctx.arena, "  {s}\n", .{m.name}));
+        }
+    }
     return 1;
 }
 
@@ -850,6 +1073,14 @@ fn jsonI64(obj: std.json.ObjectMap, key: []const u8) ?i64 {
     const v = obj.get(key) orelse return null;
     return switch (v) {
         .integer => |i| i,
+        else => null,
+    };
+}
+
+fn jsonBool(obj: std.json.ObjectMap, key: []const u8) ?bool {
+    const v = obj.get(key) orelse return null;
+    return switch (v) {
+        .bool => |b| b,
         else => null,
     };
 }
