@@ -1252,6 +1252,21 @@ pub const template =
     \\# resolution = "720p"
     \\# ratio = "16:9"
     \\
+    \\# --- Self-hosted LTX-2 video (optional) -------------------------------------
+    \\# Local service, no credential (see integrations/ltx2/README.md):
+    \\# [models."ltx-2"]
+    \\# backend = "ltx2_video"
+    \\# api_model = "ltx-2"
+    \\
+    \\# [[models."ltx-2".endpoints]]
+    \\# base_url = "http://127.0.0.1:8100/v1/videos/generations"
+    \\# auth = "none"
+    \\
+    \\# [models."ltx-2".defaults]
+    \\# duration = 6             # seconds
+    \\# resolution = "720p"
+    \\# ratio = "16:9"
+    \\
     \\# --- Local Qwen-Image-2.1 (optional) ---------------------------------------
     \\# Install the local server first (see integrations/qwen-image/README.md):
     \\#   integrations/qwen-image/install.sh   ... then run: qwen-image-server
@@ -1607,7 +1622,7 @@ test "presets load, carry their credential env, and yield to config models" {
     const seedream = cfg.findPreset("doubao-seedream-5-0-260128").?;
     try std.testing.expectEqualStrings("ARK_API_KEY", seedream.endpoints[0].api_key_env.?);
     try std.testing.expectEqualStrings("ark-secret", seedream.endpoints[0].resolved_key.?);
-    // No GEMINI_API_KEY in the test env, so that preset is not ready.
+    // No GEMINI_API_KEY in the test env, so that preset has no credential.
     try std.testing.expect(cfg.findPreset("gemini-omni-1.1-flash").?.endpoints[0].resolved_key == null);
 
     // A configured model of the same name shadows the preset.

@@ -108,6 +108,22 @@ quality = "high"
 # resolution = "720p"
 # ratio = "16:9"
 
+# --- Self-hosted LTX-2 video (optional) ---------------------------------------
+# Local service, no credential: see integrations/ltx2/README.md for the wire
+# contract and a reference server. No weights or model code live in imagine.
+# [models."ltx-2"]
+# backend = "ltx2_video"         # async: create task, poll, download
+# api_model = "ltx-2"
+#
+# [[models."ltx-2".endpoints]]
+# base_url = "http://127.0.0.1:8100/v1/videos/generations"
+# auth = "none"
+#
+# [models."ltx-2".defaults]
+# duration = 6                   # seconds
+# resolution = "720p"
+# ratio = "16:9"
+
 # --- Local Qwen-Image-2.1 (optional) -----------------------------------------
 # Install the local server first (see integrations/qwen-image/README.md):
 #   integrations/qwen-image/install.sh --prefetch

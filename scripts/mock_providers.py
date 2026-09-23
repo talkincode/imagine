@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 """Test double for the provider HTTP surfaces `imagine` speaks.
 
-This stands in for Volcengine Ark and Google Gemini so `scripts/e2e.sh` can
-exercise the real client path — create, poll, download, file writes, `--json`
-output — without a network or a credential. It implements the documented wire
-formats; it deliberately does not validate them. Its job is to test *imagine*,
-not the providers, so if a provider changes its API only the real API will say
-so.
+This stands in for Volcengine Ark, Google Gemini and a self-hosted LTX-2 service
+so `scripts/e2e.sh` can exercise the real client path — create, poll, download,
+file writes, `--json` output — without a network or a credential. It implements
+the documented wire formats; it deliberately does not validate them. Its job is
+to test *imagine*, not the providers, so if a provider changes its API only the
+real API will say so.
 
 Usage: mock_providers.py [port] [logfile]
 Prints the port it bound to on stdout, then serves until killed.
@@ -22,6 +22,9 @@ POST /v1beta/interactions                          -> interaction with a Files u
 POST /array-error/interactions                     -> 400 with an array-wrapped error
 GET  /v1beta/files/mockfile                        -> PROCESSING, then ACTIVE
 GET  /v1beta/files/mockfile:download?alt=media      -> video bytes
+POST /v1/videos/generations                        -> {"id": "ltx-mock-1"}   (self-hosted LTX-2)
+GET  /v1/videos/generations/ltx-mock-1             -> running, then succeeded + video_url
+POST /ltx-fail/videos/generations                  -> task that always fails
 GET  /cdn/*                                        -> asset bytes (no auth needed)
 """
 
@@ -33,6 +36,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 SEEDANCE_MP4 = b"SEEDANCE-MP4-BYTES"
 SEEDREAM_PNG = b"SEEDREAM-PNG-BYTES"
 OMNI_MP4 = b"GEMINI-OMNI-MP4-BYTES"
+LTX_MP4 = b"LTX2-MP4-BYTES"
 PNG_MAGIC = b"\x89PNG\r\n\x1a\n" + b"0" * 32
 
 LOG = None
@@ -92,6 +96,10 @@ class Handler(BaseHTTPRequestHandler):
                 "model": "mock", "created": 1,
                 "data": [{"url": f"http://{self.host()}/cdn/seedream.png"}],
             })
+        if self.path == "/ltx-fail/videos/generations":
+            return self.send(200, {"id": "ltx-fail"})
+        if self.path == "/v1/videos/generations":
+            return self.send(202, {"id": "ltx-mock-1"})
         if self.path == "/array-error/interactions":
             # Google wraps some errors in a one-element array.
             return self.send(400, [{"error": {"code": 400, "message": "API key not valid."}}])
@@ -130,6 +138,20 @@ class Handler(BaseHTTPRequestHandler):
                                    "mime_type": "video/mp4"})
         if self.path.startswith("/v1beta/files/mockfile:download"):
             return self.send(200, OMNI_MP4, "video/mp4")
+        if self.path == "/v1/videos/generations/ltx-mock-1":
+            if poll_count("ltx") < 2:
+                return self.send(200, {"id": "ltx-mock-1", "status": "running"})
+            return self.send(200, {
+                "id": "ltx-mock-1", "status": "succeeded",
+                "video_url": f"http://{self.host()}/cdn/ltx.mp4",
+            })
+        if self.path == "/ltx-fail/videos/generations/ltx-fail":
+            return self.send(200, {
+                "id": "ltx-fail", "status": "failed",
+                "error": {"message": "denoising ran out of memory"},
+            })
+        if self.path == "/cdn/ltx.mp4":
+            return self.send(200, LTX_MP4, "video/mp4")
         if self.path == "/cdn/seedance.mp4":
             return self.send(200, SEEDANCE_MP4, "video/mp4")
         if self.path == "/cdn/seedream.png":

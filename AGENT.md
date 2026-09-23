@@ -12,6 +12,8 @@
 - **多后端、可扩展**：新增模型 = 新增一个 body builder + 注册一行，不改动调用方。
 - **内置视频能力**：Seedance（火山方舟）与 Gemini Omni（Interactions API）为编译进二进制的后端，
   同步/异步差异由后端声明的 flow 决定；密钥只从环境变量取（`ARK_API_KEY` / `GEMINI_API_KEY`）。
+- **显式花钱边界**：会携带凭证的 provider 任务在派发前打印任务清单并要求 `--authorize-spend`
+  （或 `IMAGINE_AUTHORIZE_SPEND=1`）；二进制里没有任何价格数据，所以只报"无法估价"，不猜价格。
 - **同模型多端点并发**：一个模型可配置多个 `endpoints`（不同 URL/KEY），调度器并发分摊请求。
 - **agent 友好**：`--json` 输出机器可解析结果；`--dry-run` 只打印请求体；退出码区分成功/失败/用法错误。
 - **单一静态二进制**：纯 Zig + `std.http.Client`，不依赖 curl/jq/base64/ffmpeg 等外部命令。
@@ -21,10 +23,12 @@
 - **不是**长驻服务 / HTTP server，也**不是**库；它是一次性 CLI 进程。
 - **不做**图像/视频后处理（裁剪、放大、转码、拼接、加水印）——只负责"调用模型 → 落盘原始产物"。
 - **不托管**回调：异步任务用轮询（`--poll-interval`/`--timeout`）等待，不注册 webhook。
-- **不内置**模型权重或本地推理；只对接 HTTP 模型服务。本地模型（如 Qwen-Image-2.1）
-  由 `integrations/` 下的独立 server 进程托管，二进制里没有任何模型代码。
+- **不内置**模型权重或本地推理；只对接 HTTP 模型服务。本地模型（Qwen-Image-2.1、
+  自托管 LTX-2）由 `integrations/` 下的独立 server 进程托管，二进制里没有任何模型代码。
 - **不管理**密钥分发；密钥来自环境变量或配置文件，由调用环境负责。
 - **不重试 / 不限流**（当前阶段）：失败即如实上报，重试策略交给调用方。详见路线图。
+- **不内嵌价格表**：`--authorize-spend` 只确认"这些任务会调用带凭证的端点"，不做金额估算，
+  也不因模型/时长不同而改变判定。
 
 ## 3. 架构（src/）
 
@@ -47,10 +51,11 @@
 | `backends/volcengine_image.zig` | 火山方舟 Seedream 请求体（`size` 档位或像素、`watermark`、`image` 参考图；无 `n`/`seed`） | 同上 |
 | `backends/seedance.zig` | 火山方舟 Seedance 建任务体 + `parseCreate`/`pollUrl`/`parsePoll`（`content[]`、`status` 终态判定） | 不发起请求、不下载 |
 | `backends/gemini_video.zig` | Gemini Interactions API（Omni）建任务体 + 三个解析器（`steps[].content[].uri`、Files `state`、下载 URL） | 同上 |
+| `backends/ltx2_video.zig` | 自托管 LTX-2 服务建任务体（`prompt`/`duration`/`resolution`/`ratio`/`seed`/内联首帧）+ 三个解析器（契约见 `integrations/ltx2/`） | 不发起请求、不下载、不跑模型 |
 | `backend.zig` | 后端注册 + `generate()` 编排（同步 / 异步建任务-轮询-下载）+ 共享响应解析（b64_json / url 回退 / error）+ 凭证头 | 不解析 CLI、不写文件 |
 | `scheduler.zig` | 并发任务执行（`std.Thread` 原子认领）、落盘、进度上报、异步任务的 poll/timeout 传递 | 不构造请求体、不解析 CLI |
 | `cli.zig` | 参数解析 + help 文本 | 不发网络请求 |
-| `main.zig` | 入口 `main(init: std.process.Init)`、子命令分发、`--image` 读盘/下载、结果渲染 | 业务细节下沉到各模块 |
+| `main.zig` | 入口 `main(init: std.process.Init)`、子命令分发、`--image` 读盘/下载、结果渲染、spend 授权边界（`authorizeSpend`） | 业务细节下沉到各模块 |
 
 **唯一做进程级 IO（env/args/stdout）的是 `main.zig`**；其余模块通过参数/接口注入依赖，保持可测试、可解耦。
 
@@ -88,7 +93,7 @@ task_timeout = 600 # 单个异步任务的等待上限秒数
 [models."<model-name>"]
 backend = "openai_image" # openai_image | azure_flux | qwen_image
                          # | volcengine_image | seedance | gemini_video
-                         #（azure_image 为兼容别名）
+                         # | ltx2_video（azure_image 为兼容别名）
 api_model = "传给 API 的真实 model 字段"
 
 [[models."<model-name>".endpoints]]
@@ -121,8 +126,8 @@ watermark = false # 火山方舟：图像默认 true，视频默认 false
 |------|------|
 | `media()` | `image` / `video`：决定默认扩展名（png/mp4）与 `--json` 落到哪个数组 |
 | `flow()` | `sync`（一次请求出结果）/ `async_task`（建任务→轮询→下载） |
-| `defaultKeyEnv()` | ephemeral 模式未指定 `IMAGINE_API_KEY_ENV` 时的凭证 env（Ark→`ARK_API_KEY`、Gemini→`GEMINI_API_KEY`，其余→`AZURE_OPENAI_APIKEY`） |
-| `assetNeedsAuth()` | 产物 URL 是否必须带凭证下载（Gemini Files 需要；Ark/Azure 的预签名 URL 不能带，Azure 会因 SAS + Authorization 同时出现而拒绝） |
+| `defaultKeyEnv()` | ephemeral 模式未指定 `IMAGINE_API_KEY_ENV` 时的凭证 env（Ark→`ARK_API_KEY`、Gemini→`GEMINI_API_KEY`、LTX-2→`LTX2_API_KEY`，其余→`AZURE_OPENAI_APIKEY`） |
+| `assetNeedsAuth()` | 产物 URL 是否必须带凭证下载（Gemini Files 需要；Ark/Azure 的预签名 URL 不能带，Azure 会因 SAS + Authorization 同时出现而拒绝；本地 LTX-2 服务不需要） |
 | `inputImageStyle()` | 统一 `--image` 如何传给 provider：`url_or_data_url` / `bytes_base64` |
 
 ### 内置 presets（`presets.zig`）
@@ -169,8 +174,8 @@ imagine generate -m <model> -p <prompt> [-o -n -s --width --height \
         --format --compression --quality --seed --steps \
         --image --watermark/--no-watermark \
         --duration --resolution --ratio --poll-interval --timeout \
-        -c --config --json --dry-run -q]
-imagine batch <manifest.json> [-c --poll-interval --timeout --json]
+        -c --config --json --dry-run --authorize-spend -q]
+imagine batch <manifest.json> [-c --poll-interval --timeout --json --authorize-spend]
 imagine models [--json]
 imagine config path | init [--force] | convert | show
 imagine version | help
@@ -185,6 +190,16 @@ imagine version | help
 - 多张图/多条视频 → 文件名自动加 `-1 -2 …` 数字后缀；`-n` 对视频是"发起 n 个 provider 任务"。
 - 异步后端把 provider 的失败（HTTP 200 + `status: failed`）如实转成 `errors[]` 文案，
   例如 `task cgt-… failed: …`；超时报 `task <id> did not finish within <n>s`。
+- **花钱授权边界**：任务清单里有"带凭证的端点"（`auth != "none"` 且 key 已解析）时，
+  `generate` / `batch` 在发出任何 HTTP 请求前把计划打到 stderr（条数 + 每个任务的
+  model/backend/size/duration/resolution/ratio，以及 `cost estimate: unavailable`），
+  没有 `--authorize-spend` 或 `IMAGINE_AUTHORIZE_SPEND=1` 就以退出码 `2` 拒绝。
+  本地无鉴权端点、以及缺凭证（本来就会失败）的任务不计入、也不被拦。
+- `imagine models --json` 每项为
+  `{name, backend, media, api_model, endpoints, credential_status, availability, source}`：
+  `credential_status` = `missing` | `partial` | `configured` | `not_required`（只说明凭证是否就位），
+  `availability` 恒为 `unknown` —— 不发起付费调用就无法确认账号是否开通该模型，
+  所以不再用 `ready` 暗示"可用"。
 
 ## 6. 路线图
 
@@ -211,6 +226,11 @@ imagine version | help
   产出 `libresvg.a`（resvg 0.47.0，与 `vendor/resvg/resvg.h` 同版本），再以
   `-Dsvg-overlay=true -Dresvg-lib=…` 链接，并对产物跑 `svg render`/`text render`/`png compose`
   冒烟测试；唯一例外是 `imagine-windows-aarch64.exe`（无法交叉构建 resvg 静态库）。
+- **自托管 LTX-2 视频**：`ltx2_video` 后端（建任务 → 轮询 → 下载，首帧内联 base64）+
+  `integrations/ltx2/`（wire 契约文档 + 纯标准库参考服务，`--t2v-cmd/--i2v-cmd` 模板
+  适配任意本地 runtime，`--mock` 可无权重联调）；权重与推理仍留在服务侧。
+- **显式花钱授权**：`--authorize-spend` / `IMAGINE_AUTHORIZE_SPEND=1`，见 §5。
+- **模型可用性语义修正**：`ready` 布尔值换成 `credential_status` + `availability=unknown`。
 - **Qwen-Image-2.1 可选集成**：`qwen_image` 后端（统一参数 → `size`/`num_inference_steps`/
   `seed`/`output_format`）、`auth = "none"` 无鉴权端点、`--steps` 与 `IMAGINE_STEPS`，
   以及 `integrations/qwen-image/`（diffusers server + 安装脚本 + 文档）；同一契约也兼容

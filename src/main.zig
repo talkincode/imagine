@@ -237,7 +237,8 @@ fn cmdModels(ctx: Ctx, c: cli.Common) !u8 {
             media: []const u8,
             api_model: []const u8,
             endpoints: usize,
-            ready: bool,
+            credential_status: []const u8,
+            availability: []const u8,
             source: []const u8,
         };
         var items = try ctx.arena.alloc(Item, cfg.models.len + presets.len);
@@ -249,7 +250,8 @@ fn cmdModels(ctx: Ctx, c: cli.Common) !u8 {
                 .media = m.backend.media().toString(),
                 .api_model = m.api_model,
                 .endpoints = m.endpoints.len,
-                .ready = modelReady(m),
+                .credential_status = credentialStatus(m),
+                .availability = "unknown",
                 .source = cfg.source.toString(),
             };
             i += 1;
@@ -263,7 +265,8 @@ fn cmdModels(ctx: Ctx, c: cli.Common) !u8 {
                 .media = m.backend.media().toString(),
                 .api_model = m.api_model,
                 .endpoints = m.endpoints.len,
-                .ready = modelReady(m),
+                .credential_status = credentialStatus(m),
+                .availability = "unknown",
                 .source = "preset",
             };
             i += 1;
@@ -275,32 +278,159 @@ fn cmdModels(ctx: Ctx, c: cli.Common) !u8 {
 
     try outf(ctx, "configured models ({d}, source={s}):\n", .{ cfg.models.len, cfg.source.toString() });
     for (cfg.models) |m| {
-        const ready = if (modelReady(m)) "ready" else "no key";
-        try outf(ctx, "  {s:<28} backend={s:<17} endpoints={d} [{s}]\n", .{ m.name, m.backend.toString(), m.endpoints.len, ready });
+        try outf(ctx, "  {s:<28} backend={s:<17} endpoints={d} [credentials={s}, availability=unknown]\n", .{ m.name, m.backend.toString(), m.endpoints.len, credentialStatus(m) });
     }
     if (presets.len > 0) {
         try outf(ctx, "built-in presets ({d}, credential from env):\n", .{presets.len});
         for (presets) |m| {
-            const ready = if (modelReady(m)) "ready" else "no key";
-            try outf(ctx, "  {s:<28} backend={s:<17} env={s} [{s}]\n", .{
+            try outf(ctx, "  {s:<28} backend={s:<17} env={s} [credentials={s}, availability=unknown]\n", .{
                 m.name,
                 m.backend.toString(),
                 m.endpoints[0].api_key_env orelse "-",
-                ready,
+                credentialStatus(m),
             });
         }
     }
     return 0;
 }
 
-fn modelReady(m: types.ModelConfig) bool {
+fn credentialStatus(m: types.ModelConfig) []const u8 {
+    var required: usize = 0;
+    var configured: usize = 0;
     for (m.endpoints) |ep| {
-        // A keyless endpoint (`auth = "none"`, e.g. a local Qwen-Image server)
-        // is ready as soon as it is configured; the rest need a credential.
-        if (ep.auth == .none) return true;
-        if (ep.resolved_key != null) return true;
+        if (ep.auth == .none) continue;
+        required += 1;
+        if (ep.resolved_key != null) configured += 1;
     }
+    if (required == 0) return "not_required";
+    if (configured == 0) return "missing";
+    if (configured < required) return "partial";
+    return "configured";
+}
+
+/// One provider request the CLI is about to make, as the spend boundary sees it.
+const SpendItem = struct {
+    model: []const u8,
+    kind: types.BackendKind,
+    req: types.GenRequest,
+    /// True when this task carries a credential, so the provider may charge for
+    /// it. Keyless local endpoints (`auth = "none"`) and endpoints whose key did
+    /// not resolve are not billable: the first spends nothing, the second fails
+    /// on its missing credential before any provider call.
+    billable: bool,
+};
+
+fn spendItem(model: *const types.ModelConfig, endpoint: *const types.Endpoint, req: types.GenRequest) SpendItem {
+    return .{
+        .model = model.name,
+        .kind = model.backend,
+        .req = req,
+        .billable = endpoint.auth != .none and endpoint.resolved_key != null,
+    };
+}
+
+/// The `-n` tasks `generate` is about to dispatch: one entry per provider call,
+/// with endpoints round-robined exactly as the scheduler will assign them.
+fn generateSpendItems(ctx: Ctx, model: *const types.ModelConfig, req: types.GenRequest, count: u32) ![]const SpendItem {
+    const items = try ctx.arena.alloc(SpendItem, count);
+    for (items, 0..) |*item, i| {
+        item.* = spendItem(model, &model.endpoints[i % model.endpoints.len], req);
+    }
+    return items;
+}
+
+/// The tasks `batch` is about to dispatch.
+fn batchSpendItems(ctx: Ctx, tasks: []const scheduler.Task) ![]const SpendItem {
+    const items = try ctx.arena.alloc(SpendItem, tasks.len);
+    for (tasks, 0..) |task, i| {
+        items[i] = spendItem(task.model, task.endpoint, task.req);
+    }
+    return items;
+}
+
+/// Explicit spend authorization. `imagine` ships no price data, so instead of
+/// guessing a cost it prints the exact task plan and refuses to dispatch any
+/// billable task until the caller acknowledges it. Authorization comes from the
+/// invocation (`--authorize-spend` or `IMAGINE_AUTHORIZE_SPEND=1`) and is
+/// deliberately not a config-file key: a shared config must not be able to
+/// authorize spending silently.
+fn authorizeSpend(ctx: Ctx, items: []const SpendItem, authorized: bool) !bool {
+    var billable: usize = 0;
+    for (items) |item| {
+        if (item.billable) billable += 1;
+    }
+    if (billable == 0) return true;
+
+    try printErr(ctx.io, try std.fmt.allocPrint(
+        ctx.arena,
+        "spend authorization: {d} of {d} task(s) call a credentialed provider endpoint\n" ++
+            "cost estimate: unavailable (imagine has no provider price data)\n",
+        .{ billable, items.len },
+    ));
+    var index: usize = 0;
+    for (items) |item| {
+        if (!item.billable) continue;
+        index += 1;
+        try printSpendItem(ctx, index, item);
+    }
+    if (authorized) {
+        try printErr(ctx.io, "spend authorized: dispatching\n");
+        return true;
+    }
+    try printErr(ctx.io, "blocked before any HTTP request; rerun with --authorize-spend to allow these tasks\n");
     return false;
+}
+
+fn spendAuthorized(ctx: Ctx, flag: bool) bool {
+    if (flag) return true;
+    const raw = ctx.env.get("IMAGINE_AUTHORIZE_SPEND") orelse return false;
+    return std.mem.eql(u8, raw, "1") or
+        std.ascii.eqlIgnoreCase(raw, "true") or
+        std.ascii.eqlIgnoreCase(raw, "yes");
+}
+
+fn printSpendItem(ctx: Ctx, index: usize, item: SpendItem) !void {
+    const video = item.kind.media() == .video;
+    try printErr(ctx.io, try std.fmt.allocPrint(
+        ctx.arena,
+        "  [{d}] model={s} backend={s} size={s} duration={s} resolution={s} ratio={s}\n",
+        .{
+            index,
+            item.model,
+            item.kind.toString(),
+            try spendSize(ctx, item.kind, item.req),
+            if (video) try spendDuration(ctx, item.req.duration) else "n/a",
+            if (video) item.req.resolution orelse "provider-default" else "n/a",
+            if (video) spendRatio(item.req) else "n/a",
+        },
+    ));
+}
+
+/// The effective size a request carries: the `--size` token when set, `WxH`
+/// derived from `--width/--height`, or a note that the provider default applies.
+fn spendSize(ctx: Ctx, kind: types.BackendKind, req: types.GenRequest) ![]const u8 {
+    if (req.size) |size| return size;
+    if (req.width != null or req.height != null) {
+        return std.fmt.allocPrint(ctx.arena, "{s}x{s}", .{
+            if (req.width) |w| try std.fmt.allocPrint(ctx.arena, "{d}", .{w}) else "?",
+            if (req.height) |h| try std.fmt.allocPrint(ctx.arena, "{d}", .{h}) else "?",
+        });
+    }
+    return if (kind.media() == .video) "n/a" else "provider-default";
+}
+
+fn spendDuration(ctx: Ctx, duration: ?u32) ![]const u8 {
+    return if (duration) |value| try std.fmt.allocPrint(ctx.arena, "{d}s", .{value}) else "provider-default";
+}
+
+/// Video aspect ratio: `--ratio` wins, then a ratio-shaped `--size`, else the
+/// provider default.
+fn spendRatio(req: types.GenRequest) []const u8 {
+    if (req.ratio) |ratio| return ratio;
+    if (req.size) |size| {
+        if (util.isRatio(size)) return size;
+    }
+    return "provider-default";
 }
 
 // ---------------------------------------------------------------------------
@@ -345,6 +475,7 @@ fn cmdGenerate(ctx: Ctx, g: cli.Generate) !u8 {
             else => e,
         };
     }
+    if (!try authorizeSpend(ctx, try generateSpendItems(ctx, model, req, g.n), spendAuthorized(ctx, g.authorize_spend))) return 2;
 
     var client = std.http.Client{ .allocator = ctx.gpa, .io = ctx.io };
     defer client.deinit();
@@ -474,6 +605,8 @@ fn dryRun(
         \\  media:    {s}
         \\  endpoint: {s}
         \\  assets:   {d}
+        \\  spend:    nothing dispatched; imagine has no price data, and a real
+        \\            run asks for --authorize-spend before any provider call
         \\  request body (n=1 per call):
         \\{s}
         \\
@@ -596,7 +729,7 @@ fn cmdBatch(ctx: Ctx, b: cli.Batch) !u8 {
     defer for (task_slice) |*t| t.arena.deinit();
 
     if (b.dry_run) {
-        try outf(ctx, "dry run: {d} task(s) from manifest\n", .{task_slice.len});
+        try outf(ctx, "dry run: {d} task(s) from manifest (nothing dispatched; a real run calls credentialed endpoints only with --authorize-spend)\n", .{task_slice.len});
         for (task_slice) |*t| {
             const body = dryRunBody(ctx, t.model, t.req) catch |e| switch (e) {
                 error.DryRunBodyUnavailable => return 2,
@@ -606,6 +739,7 @@ fn cmdBatch(ctx: Ctx, b: cli.Batch) !u8 {
         }
         return 0;
     }
+    if (!try authorizeSpend(ctx, try batchSpendItems(ctx, task_slice), spendAuthorized(ctx, b.authorize_spend))) return 2;
 
     var client = std.http.Client{ .allocator = ctx.gpa, .io = ctx.io };
     defer client.deinit();
@@ -1115,6 +1249,71 @@ fn printErr(io: Io, bytes: []const u8) !void {
 fn outf(ctx: Ctx, comptime fmt: []const u8, args: anytype) !void {
     const s = try std.fmt.allocPrint(ctx.arena, fmt, args);
     try printOut(ctx.io, s);
+}
+
+test "credentialStatus reports credentials, never availability" {
+    var local_endpoints = [_]types.Endpoint{
+        .{ .base_url = "http://local", .auth = .none },
+    };
+    const local_only = types.ModelConfig{
+        .name = "m",
+        .backend = .qwen_image,
+        .api_model = "m",
+        .endpoints = &local_endpoints,
+    };
+    try std.testing.expectEqualStrings("not_required", credentialStatus(local_only));
+
+    var endpoints = [_]types.Endpoint{
+        .{ .base_url = "http://local", .auth = .none },
+        .{ .base_url = "http://paid", .auth = .bearer },
+    };
+    const model = types.ModelConfig{
+        .name = "m",
+        .backend = .openai_image,
+        .api_model = "m",
+        .endpoints = &endpoints,
+    };
+    // A paid endpoint still needs a key even when a keyless one sits next to it.
+    try std.testing.expectEqualStrings("missing", credentialStatus(model));
+    endpoints[1].resolved_key = "k";
+    try std.testing.expectEqualStrings("configured", credentialStatus(model));
+
+    var two_paid = [_]types.Endpoint{
+        .{ .base_url = "http://a", .auth = .bearer },
+        .{ .base_url = "http://b", .auth = .bearer, .resolved_key = "k" },
+    };
+    const mixed = types.ModelConfig{
+        .name = "m",
+        .backend = .openai_image,
+        .api_model = "m",
+        .endpoints = &two_paid,
+    };
+    try std.testing.expectEqualStrings("partial", credentialStatus(mixed));
+    two_paid[0].resolved_key = "k";
+    try std.testing.expectEqualStrings("configured", credentialStatus(mixed));
+    two_paid[0].resolved_key = null;
+    two_paid[1].resolved_key = null;
+    try std.testing.expectEqualStrings("missing", credentialStatus(mixed));
+}
+
+test "only a task that carries a credential is billable" {
+    const req = types.GenRequest{ .prompt = "x", .api_model = "m" };
+    const local = types.Endpoint{ .base_url = "http://local", .auth = .none };
+    const unkeyed = types.Endpoint{ .base_url = "http://paid", .auth = .bearer };
+    const keyed = types.Endpoint{ .base_url = "http://paid", .auth = .bearer, .resolved_key = "k" };
+    var keyed_endpoints = [_]types.Endpoint{keyed};
+    const model = types.ModelConfig{
+        .name = "m",
+        .backend = .seedance,
+        .api_model = "m",
+        .endpoints = &keyed_endpoints,
+    };
+
+    // A local service spends nothing; a task whose key did not resolve fails on
+    // its missing credential, so neither is gated.
+    try std.testing.expect(!spendItem(&model, &local, req).billable);
+    try std.testing.expect(!spendItem(&model, &unkeyed, req).billable);
+    try std.testing.expect(spendItem(&model, &keyed, req).billable);
 }
 
 test {

@@ -42,6 +42,8 @@ pub const Generate = struct {
     timeout: ?u32 = null,
     concurrency: ?usize = null,
     dry_run: bool = false,
+    /// Explicitly authorize requests routed to endpoints that may incur charges.
+    authorize_spend: bool = false,
     quiet: bool = false,
 };
 
@@ -54,6 +56,8 @@ pub const Batch = struct {
     /// Async video tasks: overall deadline in seconds.
     timeout: ?u32 = null,
     dry_run: bool = false,
+    /// Explicitly authorize requests routed to endpoints that may incur charges.
+    authorize_spend: bool = false,
     quiet: bool = false,
 };
 
@@ -172,9 +176,10 @@ pub const usage =
     \\      --config <path>       Use a specific config file
     \\      --json                Emit a JSON result object to stdout
     \\      --dry-run             Print request bodies without calling the API
+    \\      --authorize-spend     Explicitly allow potentially billable API tasks
     \\  -q, --quiet               Suppress progress output
     \\
-    \\VIDEO OPTIONS (seedance | gemini_video backends):
+    \\VIDEO OPTIONS (seedance | gemini_video | ltx2_video backends):
     \\      --duration <sec>      Clip length in seconds
     \\      --resolution <r>      480p | 720p | 1080p | 4k
     \\      --ratio <r>           16:9 | 9:16 | 1:1 | ...   (also --size <ratio>)
@@ -226,6 +231,7 @@ pub const usage =
     \\            volcengine_image (Ark Seedream image; env ARK_API_KEY)
     \\            seedance         (Ark Seedance video; env ARK_API_KEY)
     \\            gemini_video     (Gemini Omni video; env GEMINI_API_KEY)
+    \\            ltx2_video       (self-hosted LTX-2 video service)
     \\  Video backends create a provider task and poll it: expect minutes, not
     \\  seconds. They write one file per task and default to the .mp4 extension.
     \\  Self-hosted endpoints (e.g. a local Qwen-Image server) need no credential:
@@ -246,6 +252,7 @@ pub const usage =
     \\  IMAGINE_API_KEY_ENV       Ephemeral: env var name for key (default: backend's)
     \\  IMAGINE_SIZE/WIDTH/STEPS  Ephemeral model defaults
     \\  IMAGINE_DURATION/RESOLUTION/RATIO  Ephemeral video model defaults
+    \\  IMAGINE_AUTHORIZE_SPEND   =1 authorizes billable tasks (like --authorize-spend)
     \\
     \\EXAMPLES:
     \\  imagine models --json
@@ -410,6 +417,8 @@ fn parseGenerate(arena: std.mem.Allocator, args: []const []const u8) !Parsed {
             g.common.json = true;
         } else if (std.mem.eql(u8, name, "--dry-run")) {
             g.dry_run = true;
+        } else if (std.mem.eql(u8, name, "--authorize-spend")) {
+            g.authorize_spend = true;
         } else if (std.mem.eql(u8, name, "-q") or std.mem.eql(u8, name, "--quiet")) {
             g.quiet = true;
         } else if (std.mem.startsWith(u8, name, "-")) {
@@ -467,6 +476,8 @@ fn parseBatch(arena: std.mem.Allocator, args: []const []const u8) !Parsed {
             b.common.json = true;
         } else if (std.mem.eql(u8, name, "--dry-run")) {
             b.dry_run = true;
+        } else if (std.mem.eql(u8, name, "--authorize-spend")) {
+            b.authorize_spend = true;
         } else if (std.mem.eql(u8, name, "-q") or std.mem.eql(u8, name, "--quiet")) {
             b.quiet = true;
         } else if (std.mem.startsWith(u8, name, "-")) {

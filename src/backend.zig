@@ -19,6 +19,7 @@ const qwen_image = @import("backends/qwen_image.zig");
 const seedance = @import("backends/seedance.zig");
 const volcengine_image = @import("backends/volcengine_image.zig");
 const gemini_video = @import("backends/gemini_video.zig");
+const ltx2_video = @import("backends/ltx2_video.zig");
 
 const user_agent = "imagine/" ++ @import("version.zig").string;
 
@@ -34,11 +35,11 @@ pub const GenOptions = struct {
 
 /// File extension for the asset a backend will write. Image backends follow
 /// `--format` (the provider returns what it was asked for, or its own default);
-/// `gemini_video` is pinned to mp4 because its API has no container parameter,
-/// and naming the file anything else would be a lie.
+/// `gemini_video` and `ltx2_video` are pinned to mp4 because their APIs have no
+/// container parameter, and naming the file anything else would be a lie.
 pub fn outputExt(kind: types.BackendKind, format: ?[]const u8) []const u8 {
     return switch (kind) {
-        .gemini_video => "mp4",
+        .gemini_video, .ltx2_video => "mp4",
         else => util.extForFormat(format orelse kind.media().defaultFormat()),
     };
 }
@@ -53,6 +54,7 @@ pub fn buildBody(kind: types.BackendKind, allocator: std.mem.Allocator, req: typ
         .seedance => seedance.buildBody(allocator, req),
         .volcengine_image => volcengine_image.buildBody(allocator, req),
         .gemini_video => gemini_video.buildBody(allocator, req),
+        .ltx2_video => ltx2_video.buildBody(allocator, req),
     };
 }
 
@@ -94,6 +96,11 @@ fn asyncImpl(kind: types.BackendKind) ?Async {
             .parse_create = gemini_video.parseCreate,
             .poll_url = gemini_video.pollUrl,
             .parse_poll = gemini_video.parsePoll,
+        },
+        .ltx2_video => .{
+            .parse_create = ltx2_video.parseCreate,
+            .poll_url = ltx2_video.pollUrl,
+            .parse_poll = ltx2_video.parsePoll,
         },
         .openai_image, .azure_flux, .qwen_image, .volcengine_image => null,
     };

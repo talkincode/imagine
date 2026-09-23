@@ -87,6 +87,20 @@ api_model = "m"
 base_url = "$base/api/v3/images/generations"
 api_key = "k"
 
+[models."ltx2"]
+backend = "ltx2_video"
+api_model = "ltx-2"
+[[models."ltx2".endpoints]]
+base_url = "$base/v1/videos/generations"
+auth = "none"
+
+[models."ltx2-fail"]
+backend = "ltx2_video"
+api_model = "ltx-2"
+[[models."ltx2-fail".endpoints]]
+base_url = "$base/ltx-fail/videos/generations"
+auth = "none"
+
 [models."seedream"]
 backend = "volcengine_image"
 api_model = "doubao-seedream-5-0-260128"
@@ -127,7 +141,7 @@ rc() { if [ "$1" -eq 0 ]; then echo 0; else echo 1; fi; }
 
 echo "--- seedance: create -> poll -> download"
 "$bin" generate -m seedance -p "a fox in snow" --ratio 16:9 -o "$work/out/fox.mp4" \
-    --config "$work/config.toml" --json > "$work/r.json"; rc_seed=$?
+    --authorize-spend --config "$work/config.toml" --json > "$work/r.json"; rc_seed=$?
 check "exit code" 0 "$(rc $rc_seed)"
 check "ok" True "$(field "$work/r.json" "d['ok']")"
 check "media" video "$(field "$work/r.json" "d['media']")"
@@ -154,7 +168,7 @@ for line in open('$work/requests.log'):
 
 echo "--- gemini omni: inline first frame, Files poll, authenticated download"
 "$bin" generate -m omni -p "x" --image "$work/first.png" --duration 5 \
-    -o "$work/out/omni.mp4" --config "$work/config.toml" --json > "$work/r.json"; rc_omni=$?
+    -o "$work/out/omni.mp4" --authorize-spend --config "$work/config.toml" --json > "$work/r.json"; rc_omni=$?
 check "exit code" 0 "$(rc $rc_omni)"
 check "downloaded bytes" "GEMINI-OMNI-MP4-BYTES" "$(cat "$work/out/omni.mp4")"
 check "inline image + uri delivery" "image/png uri" \
@@ -178,7 +192,7 @@ for line in open('$work/requests.log'):
 
 echo "--- gemini omni: URL first frame is fetched and mime-sniffed"
 "$bin" generate -m omni -p "x" --image "$base/cdn/first-frame" -o "$work/out/url.mp4" \
-    --config "$work/config.toml" --json > "$work/r.json"; rc_url=$?
+    --authorize-spend --config "$work/config.toml" --json > "$work/r.json"; rc_url=$?
 check "exit code" 0 "$(rc $rc_url)"
 check "sniffed png" "image/png" \
     "$(python3 -c "
@@ -192,7 +206,7 @@ for line in open('$work/requests.log'):
 
 echo "--- volcengine image: synchronous, watermark off"
 "$bin" generate -m seedream -p "a city" --no-watermark -o "$work/out/city.png" \
-    --config "$work/config.toml" --json > "$work/r.json"; rc_img=$?
+    --authorize-spend --config "$work/config.toml" --json > "$work/r.json"; rc_img=$?
 check "exit code" 0 "$(rc $rc_img)"
 check "media" image "$(field "$work/r.json" "d['media']")"
 check "downloaded bytes" "SEEDREAM-PNG-BYTES" "$(cat "$work/out/city.png")"
@@ -208,13 +222,13 @@ for line in open('$work/requests.log'):
 
 echo "--- -n fans out into independent tasks with numbered paths"
 "$bin" generate -m seedance -p x -n 2 -o "$work/out/two.mp4" -c 2 \
-    --config "$work/config.toml" --json > "$work/r.json"; rc_n=$?
+    --authorize-spend --config "$work/config.toml" --json > "$work/r.json"; rc_n=$?
 check "exit code" 0 "$(rc $rc_n)"
 check "numbered paths" "['$work/out/two-1.mp4', '$work/out/two-2.mp4']" \
     "$(field "$work/r.json" "[v['path'] for v in d['videos']]")"
 
 echo "--- batch: mixed video and image jobs"
-"$bin" batch "$work/jobs.json" --config "$work/config.toml" -c 3 --json > "$work/r.json"; rc_batch=$?
+"$bin" batch "$work/jobs.json" --authorize-spend --config "$work/config.toml" -c 3 --json > "$work/r.json"; rc_batch=$?
 check "exit code" 0 "$(rc $rc_batch)"
 check "task count" 4 "$(field "$work/r.json" "len(d['tasks'])")"
 check "per-task media" "['video', 'image', 'image', 'video']" \
@@ -234,7 +248,7 @@ echo "--- provider-side failure (HTTP 200 + status failed)"
 # Expected to fail, so `set -e` is suspended around it.
 set +e
 "$bin" generate -m seedance-fail -p x -o "$work/out/fail.mp4" \
-    --config "$work/config.toml" --json > "$work/r.json"
+    --authorize-spend --config "$work/config.toml" --json > "$work/r.json"
 rc_fail=$?
 set -e
 check "exit code" 1 "$(rc $rc_fail)"
@@ -246,7 +260,7 @@ echo "--- timeout is bounded and reported"
 start=$(date +%s)
 set +e
 "$bin" generate -m seedance-slow -p x -o "$work/out/slow.mp4" \
-    --config "$work/config.toml" --poll-interval 1 --timeout 3 --json > "$work/r.json"
+    --authorize-spend --config "$work/config.toml" --poll-interval 1 --timeout 3 --json > "$work/r.json"
 rc_slow=$?
 set -e
 elapsed=$(( $(date +%s) - start ))
@@ -259,7 +273,7 @@ env -u GEMINI_API_KEY -u ARK_API_KEY HOME="$work" \
     IMAGINE_BASE_URL="$base/api/v3/contents/generations/tasks" \
     IMAGINE_MODEL=doubao-seedance-2-5-260628 IMAGINE_BACKEND=seedance ARK_API_KEY=k \
     "$bin" generate -p "a fox" --duration 4 -o "$work/out/eph.mp4" \
-    --poll-interval 1 --timeout 20 --json > "$work/r.json"; rc_eph=$?
+    --authorize-spend --poll-interval 1 --timeout 20 --json > "$work/r.json"; rc_eph=$?
 check "exit code" 0 "$(rc $rc_eph)"
 check "no config file needed" True "$(field "$work/r.json" "d['ok']")"
 check "missing-key hint names ARK_API_KEY" True \
@@ -281,7 +295,7 @@ check "preset run reports the missing credential" True \
 
 echo "--- error envelopes: array-wrapped (Gemini) and unsupported --image"
 set +e
-"$bin" generate -m omni-bad-key -p x -o "$work/out/bad.mp4" --config "$work/config.toml" --json > "$work/r.json"
+"$bin" generate -m omni-bad-key -p x -o "$work/out/bad.mp4" --authorize-spend --config "$work/config.toml" --json > "$work/r.json"
 rc_bad=$?
 set -e
 check "array-wrapped error exit code" 1 "$(rc $rc_bad)"
@@ -304,7 +318,7 @@ cat > "$work/preset-jobs.json" <<JSON
 JSON
 set +e
 env -u GEMINI_API_KEY HOME="$work/none" ARK_API_KEY=k "$bin" batch "$work/preset-jobs.json" \
-    --json > "$work/r.json" 2>&1
+    --authorize-spend --json > "$work/r.json" 2> "$work/preset-err.txt"
 rc_preset=$?
 set -e
 # No network here, so this fails at the provider — what matters is that the job
@@ -330,6 +344,102 @@ check "media shown" True "$(grep -q 'media:    video' "$work/dry.txt" && echo Tr
 check "poll settings shown" True "$(grep -q 'giving up after' "$work/dry.txt" && echo True || echo False)"
 check "inlined base64 elided" True \
     "$(grep -q 'bytes of base64 elided' "$work/dry.txt" && echo True || echo False)"
+check "spend boundary shown" True \
+    "$(grep -q -- '--authorize-spend' "$work/dry.txt" && echo True || echo False)"
+
+echo "--- ltx2_video: self-hosted service, first-frame image, no credential"
+"$bin" generate -m ltx2 -p "a lawyer speaking to camera" --image "$work/first.png" \
+    --duration 6 --resolution 720p --ratio 16:9 -o "$work/out/ltx.mp4" \
+    --config "$work/config.toml" --json > "$work/r.json"; rc_ltx=$?
+check "exit code" 0 "$(rc $rc_ltx)"
+check "media" video "$(field "$work/r.json" "d['media']")"
+check "downloaded bytes" "LTX2-MP4-BYTES" "$(cat "$work/out/ltx.mp4")"
+check "create body carries video params and an inline first frame" "ltx-2 16:9 720p 6 image/png" \
+    "$(python3 -c "
+import json,sys
+for line in open('$work/requests.log'):
+    r = json.loads(line)
+    if r['method'] == 'POST' and r['path'] == '/v1/videos/generations':
+        b = json.loads(r['body'])
+        print(b['model'], b['ratio'], b['resolution'], b['duration'], b['image']['mime_type']); break
+")"
+check "keyless local endpoint gets no credential header" "None" \
+    "$(python3 -c "
+import json,sys
+for line in open('$work/requests.log'):
+    r = json.loads(line)
+    if r['method'] == 'POST' and r['path'] == '/v1/videos/generations':
+        print(r['authorization']); break
+")"
+check "downloaded without a credential" True \
+    "$(python3 -c "
+import json,sys
+for line in open('$work/requests.log'):
+    r = json.loads(line)
+    if r['method'] == 'GET' and r['path'] == '/cdn/ltx.mp4':
+        print(r['authorization'] is None); break
+")"
+
+echo "--- ltx2_video: provider-side failure is reported"
+set +e
+"$bin" generate -m ltx2-fail -p x -o "$work/out/ltx-fail.mp4" \
+    --config "$work/config.toml" --json > "$work/r.json"
+rc_ltx_fail=$?
+set -e
+check "exit code" 1 "$(rc $rc_ltx_fail)"
+check "provider message passed through" True \
+    "$(field "$work/r.json" "'out of memory' in d['errors'][0] and 'ltx-fail' in d['errors'][0]")"
+
+echo "--- spend boundary: a paid task needs explicit authorization"
+before=$(wc -l < "$work/requests.log")
+set +e
+"$bin" generate -m seedance -p x -n 3 -o "$work/out/blocked.mp4" \
+    --config "$work/config.toml" > "$work/blocked.txt" 2>&1
+rc_blocked=$?
+set -e
+after=$(wc -l < "$work/requests.log")
+check "exit code" 2 "$rc_blocked"
+check "task count shown" True \
+    "$(grep -q 'spend authorization: 3 of 3 task(s)' "$work/blocked.txt" && echo True || echo False)"
+check "every task listed with its parameters" 3 "$(grep -c '^  \[[0-9]\+\] model=seedance' "$work/blocked.txt")"
+check "no cost estimate is implied" True \
+    "$(grep -q 'cost estimate: unavailable' "$work/blocked.txt" && echo True || echo False)"
+check "no provider request was made" "$before" "$after"
+check "nothing was written" False "$([ -f "$work/out/blocked.mp4" ] && echo True || echo False)"
+
+echo "--- spend boundary: batch is blocked until authorized"
+before=$(wc -l < "$work/requests.log")
+set +e
+"$bin" batch "$work/jobs.json" --config "$work/config.toml" > "$work/blocked-batch.txt" 2>&1
+rc_blocked_batch=$?
+set -e
+after=$(wc -l < "$work/requests.log")
+check "exit code" 2 "$rc_blocked_batch"
+check "every job listed" 4 "$(grep -c '^  \[[0-9]\+\] model=' "$work/blocked-batch.txt")"
+check "no provider request was made" "$before" "$after"
+
+echo "--- spend boundary: IMAGINE_AUTHORIZE_SPEND authorizes a whole run"
+env IMAGINE_AUTHORIZE_SPEND=1 "$bin" generate -m seedance -p x -o "$work/out/env-ok.mp4" \
+    --config "$work/config.toml" --json > "$work/r.json"; rc_env_ok=$?
+check "exit code" 0 "$(rc $rc_env_ok)"
+check "downloaded bytes" "SEEDANCE-MP4-BYTES" "$(cat "$work/out/env-ok.mp4")"
+
+echo "--- models: credentials and availability are reported separately"
+check "no bare ready flag, availability unknown" True \
+    "$(env -u ARK_API_KEY -u GEMINI_API_KEY HOME="$work" "$bin" models --json | python3 -c "
+import json,sys
+d = json.load(sys.stdin)
+print(all('ready' not in m for m in d)
+      and all(m['availability'] == 'unknown' for m in d)
+      and all(m['credential_status'] == 'missing' for m in d))
+")"
+check "a key only flips credential_status" True \
+    "$(env -u GEMINI_API_KEY HOME="$work" ARK_API_KEY=k "$bin" models --json | python3 -c "
+import json,sys
+d = json.load(sys.stdin)
+ark = [m for m in d if m['backend'] == 'seedance']
+print(bool(ark) and all(m['credential_status'] == 'configured' and m['availability'] == 'unknown' for m in ark))
+")"
 
 echo
 echo "e2e: $pass passed, $fail failed"

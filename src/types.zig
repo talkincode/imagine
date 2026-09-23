@@ -116,6 +116,8 @@ pub const BackendKind = enum {
     /// downloaded. Veo is a different protocol (`generateContent` +
     /// `:predictLongRunning`) and deliberately has no alias here.
     gemini_video,
+    /// Self-hosted LTX-2 service using imagine's documented async video contract.
+    ltx2_video,
 
     pub fn fromString(s: []const u8) ?BackendKind {
         // openai_image is canonical; azure_image is kept as a legacy alias.
@@ -135,6 +137,9 @@ pub const BackendKind = enum {
         if (std.mem.eql(u8, s, "gemini_video") or std.mem.eql(u8, s, "gemini-video") or
             std.mem.eql(u8, s, "gemini_omni") or std.mem.eql(u8, s, "gemini-omni"))
             return .gemini_video;
+        if (std.mem.eql(u8, s, "ltx2_video") or std.mem.eql(u8, s, "ltx2-video") or
+            std.mem.eql(u8, s, "ltx_video") or std.mem.eql(u8, s, "ltx-2") or
+            std.mem.eql(u8, s, "ltx2")) return .ltx2_video;
         return null;
     }
 
@@ -146,19 +151,20 @@ pub const BackendKind = enum {
             .seedance => "seedance",
             .volcengine_image => "volcengine_image",
             .gemini_video => "gemini_video",
+            .ltx2_video => "ltx2_video",
         };
     }
 
     pub fn media(self: BackendKind) Media {
         return switch (self) {
-            .seedance, .gemini_video => .video,
+            .seedance, .gemini_video, .ltx2_video => .video,
             else => .image,
         };
     }
 
     pub fn flow(self: BackendKind) Flow {
         return switch (self) {
-            .seedance, .gemini_video => .async_task,
+            .seedance, .gemini_video, .ltx2_video => .async_task,
             else => .sync,
         };
     }
@@ -169,6 +175,7 @@ pub const BackendKind = enum {
         return switch (self) {
             .seedance, .volcengine_image => "ARK_API_KEY",
             .gemini_video => "GEMINI_API_KEY",
+            .ltx2_video => "LTX2_API_KEY",
             else => "AZURE_OPENAI_APIKEY",
         };
     }
@@ -185,7 +192,7 @@ pub const BackendKind = enum {
 
     pub fn inputImageStyle(self: BackendKind) InputImageStyle {
         return switch (self) {
-            .gemini_video => .bytes_base64,
+            .gemini_video, .ltx2_video => .bytes_base64,
             .seedance, .volcengine_image => .url_or_data_url,
             .openai_image, .azure_flux, .qwen_image => .unsupported,
         };
@@ -333,6 +340,7 @@ test "AuthScheme/BackendKind round trips" {
     try std.testing.expectEqual(BackendKind.seedance, BackendKind.fromString("seedance").?);
     try std.testing.expectEqual(BackendKind.volcengine_image, BackendKind.fromString("seedream").?);
     try std.testing.expectEqual(BackendKind.gemini_video, BackendKind.fromString("gemini_omni").?);
+    try std.testing.expectEqual(BackendKind.ltx2_video, BackendKind.fromString("ltx-2").?);
     // Veo speaks a different protocol, so it must not resolve to this backend.
     try std.testing.expect(BackendKind.fromString("veo") == null);
 }
@@ -340,18 +348,22 @@ test "AuthScheme/BackendKind round trips" {
 test "backend routing metadata" {
     try std.testing.expectEqual(Media.video, BackendKind.seedance.media());
     try std.testing.expectEqual(Media.video, BackendKind.gemini_video.media());
+    try std.testing.expectEqual(Media.video, BackendKind.ltx2_video.media());
     try std.testing.expectEqual(Media.image, BackendKind.volcengine_image.media());
     try std.testing.expectEqual(Flow.async_task, BackendKind.seedance.flow());
     try std.testing.expectEqual(Flow.async_task, BackendKind.gemini_video.flow());
+    try std.testing.expectEqual(Flow.async_task, BackendKind.ltx2_video.flow());
     try std.testing.expectEqual(Flow.sync, BackendKind.volcengine_image.flow());
     try std.testing.expectEqualStrings("mp4", Media.video.defaultFormat());
     try std.testing.expectEqualStrings("png", Media.image.defaultFormat());
     try std.testing.expectEqualStrings("ARK_API_KEY", BackendKind.seedance.defaultKeyEnv());
     try std.testing.expectEqualStrings("GEMINI_API_KEY", BackendKind.gemini_video.defaultKeyEnv());
+    try std.testing.expectEqualStrings("LTX2_API_KEY", BackendKind.ltx2_video.defaultKeyEnv());
     try std.testing.expectEqualStrings("AZURE_OPENAI_APIKEY", BackendKind.openai_image.defaultKeyEnv());
     try std.testing.expect(BackendKind.gemini_video.assetNeedsAuth());
     try std.testing.expect(!BackendKind.seedance.assetNeedsAuth());
     try std.testing.expectEqual(InputImageStyle.bytes_base64, BackendKind.gemini_video.inputImageStyle());
+    try std.testing.expectEqual(InputImageStyle.bytes_base64, BackendKind.ltx2_video.inputImageStyle());
     try std.testing.expectEqual(InputImageStyle.url_or_data_url, BackendKind.seedance.inputImageStyle());
     try std.testing.expectEqual(InputImageStyle.unsupported, BackendKind.openai_image.inputImageStyle());
 }

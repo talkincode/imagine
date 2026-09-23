@@ -20,6 +20,9 @@ scheduling. Single static Zig binary — no `curl`/`jq`/`base64` dependencies.
 - **Built-in video** — `seedance` (Volcengine Ark) and `gemini_video` (Gemini
   Omni) create a provider task, poll it, and save the result; credentials come
   from `ARK_API_KEY` / `GEMINI_API_KEY`.
+- **Spend boundary** — a task that carries a credential is listed and blocked
+  until you pass `--authorize-spend` (or `IMAGINE_AUTHORIZE_SPEND=1`); imagine
+  ships no price data, so it says that instead of guessing a cost.
 - **Built-in Volcengine images** — `volcengine_image` drives Ark Seedream.
 - **Dynamic models** — add/rename/remove models in config; discover with `imagine models`.
 - **Concurrent scheduling** — multiple endpoints per model are load-balanced.
@@ -28,9 +31,14 @@ scheduling. Single static Zig binary — no `curl`/`jq`/`base64` dependencies.
 Also supports Azure FLUX via `azure_flux` (width/height body). Starter config
 ships example model entries you can edit freely.
 
-An optional `qwen_image` backend drives a **local Qwen-Image-2.1 server**
-(diffusers or vLLM-Omni) with the same unified parameters — no credential, no
-model code in the binary. See [`integrations/qwen-image`](integrations/qwen-image/README.md).
+Two optional local backends drive **self-hosted models** with the same unified
+parameters — no credential, no weights, no model code in the binary:
+
+- `qwen_image` — a local Qwen-Image-2.1 server (diffusers or vLLM-Omni):
+  [`integrations/qwen-image`](integrations/qwen-image/README.md).
+- `ltx2_video` — a local LTX-2 video service (text-to-video and image-to-video),
+  with a documented wire contract and a dependency-free reference server:
+  [`integrations/ltx2`](integrations/ltx2/README.md).
 
 
 ## Install
@@ -80,17 +88,17 @@ Building from source requires **Zig ≥ 0.16.0** (`brew install zig` or
 ```bash
 imagine config init                      # write ~/.imagine/config.toml (example models)
 export AZURE_OPENAI_APIKEY="your-key"    # or edit api_key_env / api_key in config
-imagine models                           # list configured models and readiness (source=file|ephemeral)
+imagine models                           # models + presets, with credential status (source=file|ephemeral|preset)
 
 # Use a model name printed by `imagine models` (not a fixed name from docs):
 imagine generate -m <model> -p "A photograph of a red fox in an autumn forest" -o fox.png
 imagine generate -m <model> -p "a city at dusk" --width 1024 --height 1024 -o city.png
-imagine generate -m <model> -p "logo concept" -n 4 -o logo.png -c 4
+imagine generate -m <model> -p "logo concept" -n 4 -o logo.png -c 4 --authorize-spend
 
 # No config file — ephemeral env (single model; -m optional):
 IMAGINE_BASE_URL="https://host/.../images/generations" \
 IMAGINE_MODEL="MAI-Image-2.6-Flash" AZURE_OPENAI_APIKEY="..." \
-  imagine generate -p "a fox" -o fox.png
+  IMAGINE_AUTHORIZE_SPEND=1 imagine generate -p "a fox" -o fox.png
 
 # Video, no config file at all: built-in presets + one env key
 export ARK_API_KEY="..."              # Volcengine Ark (Seedance / Seedream)
@@ -100,6 +108,9 @@ imagine generate -m doubao-seedance-2-5-260628 -p "a fox in snow" \
 export GEMINI_API_KEY="..."           # Google Gemini Omni (video)
 imagine generate -m gemini-omni-1.1-flash -p "a marble run" --image first.png -o run.mp4
 ```
+
+Paid calls need `--authorize-spend` (or `IMAGINE_AUTHORIZE_SPEND=1`); see
+[Spend authorization](#spend-authorization).
 
 ## Commands
 
@@ -141,6 +152,7 @@ imagine version | help
 | `--config <path>` | Use a specific config file |
 | `--json` | Emit a JSON result object |
 | `--dry-run` | Print request body without calling the API |
+| `--authorize-spend` | Allow tasks that call a credentialed (billable) endpoint |
 | `-q, --quiet` | Suppress progress |
 
 Exit codes: `0` success · `1` run failure (incl. partial) · `2` usage error.
@@ -158,6 +170,7 @@ provider tasks). Progress prints a `start …` line when a task is submitted.
 |---------|----------------|----------------|
 | `seedance` | Volcengine Ark `contents/generations/tasks` (Seedance) | `ARK_API_KEY` |
 | `gemini_video` | Google Gemini Interactions API (Omni) | `GEMINI_API_KEY` (`x-goog-api-key`) |
+| `ltx2_video` | A self-hosted LTX-2 service ([contract](integrations/ltx2/README.md)) | none — local endpoint |
 
 ```bash
 # Volcengine Ark Seedance — text to video
@@ -191,6 +204,49 @@ takes bytes). The declared image type comes from the file's magic bytes, so an
 extension-less URL works. Backends that take no image input (`openai_image`,
 `azure_flux`, `qwen_image`) reject `--image` with a usage error rather than
 ignoring it.
+
+`ltx2_video` speaks the same async flow to a service on your own machine
+(text-to-video and image-to-video); nothing leaves the box and no credential is
+involved, so those runs are not gated by `--authorize-spend`. The wire contract,
+a dependency-free reference server (adapting any local runtime through a command
+template) and the config block live in
+[`integrations/ltx2`](integrations/ltx2/README.md).
+
+### Spend authorization
+
+Every task that carries a credential is a request a provider may bill for, so
+`imagine` stops before the first HTTP call and shows exactly what it would send:
+
+```
+$ imagine generate -m doubao-seedance-2-5-260628 -p "a fox" -n 3 -o fox.mp4
+spend authorization: 3 of 3 task(s) call a credentialed provider endpoint
+cost estimate: unavailable (imagine has no provider price data)
+  [1] model=doubao-seedance-2-5-260628 backend=seedance size=n/a duration=provider-default resolution=provider-default ratio=provider-default
+  [2] model=doubao-seedance-2-5-260628 backend=seedance size=n/a duration=provider-default resolution=provider-default ratio=provider-default
+  [3] model=doubao-seedance-2-5-260628 backend=seedance size=n/a duration=provider-default resolution=provider-default ratio=provider-default
+blocked before any HTTP request; rerun with --authorize-spend to allow these tasks
+```
+
+Add `--authorize-spend` (or set `IMAGINE_AUTHORIZE_SPEND=1` for a whole agent or
+CI run) and the same plan is printed with `spend authorized: dispatching`.
+The refusal is a usage error: exit code `2`, nothing dispatched, no file
+written, and no provider request in the logs.
+
+Rules, so the boundary stays predictable:
+
+- **One coherent rule** — any task whose endpoint carries a credential (inline
+  `api_key` or a resolved `api_key_env`) is gated, whether it is one task or a
+  hundred, `generate` or `batch`.
+- **Local endpoints are never gated** — `auth = "none"` (a local Qwen-Image or
+  LTX-2 server) spends nothing.
+- **Missing credentials are not gated** — such a task fails on its missing key
+  before it could reach a provider, so you still get that clearer error.
+- **No cost estimate** — imagine encodes no price data. It reports
+  `cost estimate: unavailable` rather than implying a number.
+- **The plan always goes to stderr**, so `--json` stdout stays parseable.
+- **`--dry-run` dispatches nothing** and needs no authorization.
+- **Authorization is per invocation**, never a config-file key: a shared config
+  must not be able to authorize spending silently.
 
 ### image composition
 
@@ -257,6 +313,18 @@ Size limits are **provider- and deployment-specific**, not fixed in imagine.
 Put preferred sizes in each model's `defaults`, discover models with
 `imagine models`, and use `--dry-run` or `--json` `errors[]` when debugging.
 
+`imagine models` reports two separate things per model, because "has a key" and
+"can invoke this model" are not the same claim:
+
+| Field | Values | Meaning |
+|-------|--------|---------|
+| `credential_status` | `missing` / `partial` / `configured` / `not_required` | whether the endpoints' credentials resolve right now |
+| `availability` | `unknown` | whether the account may actually invoke the model — not knowable without a paid call, so it is never reported as `ready` |
+
+A key that exists but is not activated for the model (`ModelNotOpen`,
+`AccessDenied`) therefore shows up as an ordinary provider error at generation
+time, not as a falsely optimistic model listing.
+
 | Backend | Typical params |
 |---------|----------------|
 | `openai_image` | `--size` (e.g. `1024x1024`); optional `--format` / `--quality` |
@@ -265,6 +333,7 @@ Put preferred sizes in each model's `defaults`, discover models with
 | `volcengine_image` | `--size` (tier `1K`/`2K`/`4K` or `WxH`), `--format`, `--no-watermark` |
 | `seedance` | `--duration`, `--resolution`, `--ratio`, `--image`, `--no-watermark` |
 | `gemini_video` | `--duration`, `--resolution`, `--ratio`, `--image`, `--seed` |
+| `ltx2_video` | `--duration`, `--resolution`, `--ratio`, `--image`, `--seed` |
 
 ### Local Qwen-Image-2.1 (optional)
 
@@ -309,6 +378,39 @@ it in the prompt and keep `--format png`. Hardware notes, the editing endpoint,
 and troubleshooting live in
 [`integrations/qwen-image/README.md`](integrations/qwen-image/README.md).
 
+### Local LTX-2 video (optional)
+
+`ltx2_video` talks to a video service on your own machine (an MLX or PyTorch
+LTX-2 build) with the same async flow as the hosted video backends. Weights and
+inference stay in that service; the wire contract and a dependency-free
+reference server — which adapts any local runtime, including a CLI, through a
+command template — live in
+[`integrations/ltx2/README.md`](integrations/ltx2/README.md):
+
+```bash
+python3 integrations/ltx2/server.py --port 8100 --mock   # wiring check, no weights
+```
+
+```toml
+[models."ltx-2"]
+backend = "ltx2_video"
+api_model = "ltx-2"
+
+[[models."ltx-2".endpoints]]
+base_url = "http://127.0.0.1:8100/v1/videos/generations"
+auth = "none"                 # local servers take no key
+
+[models."ltx-2".defaults]
+duration = 6
+resolution = "720p"
+ratio = "16:9"
+```
+
+```bash
+imagine generate -m ltx-2 -p "a fox in snow" -o fox.mp4
+imagine generate -m ltx-2 --image fox.png -p "the fox turns to camera" -o turn.mp4
+```
+
 ### batch manifest
 
 ```json
@@ -328,7 +430,9 @@ and troubleshooting live in
 Per-job keys: `model, prompt, output, size, width, height, n, format, compression, quality,
 seed, steps, duration, resolution, ratio, image, watermark`.
 Use model names from `imagine models` (config models or built-in presets).
-`--poll-interval` / `--timeout` apply to every video job in the manifest.
+`--poll-interval` / `--timeout` apply to every video job in the manifest, and a
+manifest whose jobs reach credentialed endpoints needs `--authorize-spend`
+exactly like `generate` does.
 
 ## Configuration
 
