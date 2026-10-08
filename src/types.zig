@@ -80,13 +80,14 @@ pub const Flow = enum {
     async_task,
 };
 
-/// How the unified `--image` (first-frame / reference) input reaches a provider.
+/// How images from the repeatable `--image` flag reach a provider.
 pub const InputImageStyle = enum {
     /// Accepts a URL as-is, and a base64 `data:` URL for local files.
     url_or_data_url,
-    /// Accepts raw base64 bytes plus a MIME type (never a URL).
+    /// Needs image bytes plus a MIME type; URL inputs are fetched before the
+    /// backend builds its provider-specific inline representation.
     bytes_base64,
-    /// Takes no image at all: sending one would be silently dropped, so the CLI
+    /// Takes no image at all: sending any would be silently dropped, so the CLI
     /// rejects `--image` for these backends instead.
     unsupported,
 };
@@ -96,16 +97,18 @@ pub const InputImageStyle = enum {
 /// Logical model names are never hardcoded — they come from config (the one
 /// exception is the convenience preset catalog in `presets.zig`).
 ///
-/// Routing metadata (media kind, flow, credential env, download auth) lives on
-/// this enum because every module already depends on `types.zig`; the wire
+/// Routing metadata (media kind, flow, credential env, download auth, image
+/// input shape and limit) lives on this enum because every module already
+/// depends on `types.zig`; the wire
 /// formats themselves live in `backends/*`.
 pub const BackendKind = enum {
     /// OpenAI-compatible `images/generations` (Azure OpenAI, OpenAI, etc.).
     openai_image,
     /// Azure-hosted Black Forest Labs FLUX (width/height body).
     azure_flux,
-    /// Qwen-Image text-to-image (`QwenImage21Pipeline`) served locally over an
-    /// OpenAI-compatible `images/generations` endpoint. See `integrations/qwen-image`.
+    /// Qwen-Image text-to-image and multi-reference editing (`QwenImage21Pipeline`)
+    /// served locally over an OpenAI-compatible `images/generations` endpoint.
+    /// See `integrations/qwen-image`.
     qwen_image,
     /// Volcengine Ark video generation (Seedance): create task, poll, download.
     seedance,
@@ -192,9 +195,19 @@ pub const BackendKind = enum {
 
     pub fn inputImageStyle(self: BackendKind) InputImageStyle {
         return switch (self) {
-            .gemini_video, .ltx2_video => .bytes_base64,
+            .gemini_video, .ltx2_video, .qwen_image => .bytes_base64,
             .seedance, .volcengine_image => .url_or_data_url,
-            .openai_image, .azure_flux, .qwen_image => .unsupported,
+            .openai_image, .azure_flux => .unsupported,
+        };
+    }
+
+    /// Maximum number of `--image` references accepted per generation request.
+    /// Qwen supports up to ten; other image-input backends use a single frame.
+    pub fn maxInputImages(self: BackendKind) usize {
+        return switch (self) {
+            .qwen_image => 10,
+            .seedance, .volcengine_image, .gemini_video, .ltx2_video => 1,
+            .openai_image, .azure_flux => 0,
         };
     }
 };
@@ -245,10 +258,10 @@ pub const ModelConfig = struct {
     defaults: ModelDefaults = .{},
 };
 
-/// A first-frame / reference image for image-to-video. `source` is what the
-/// caller typed (URL or path); `bytes` is filled in when the file had to be
-/// read, either because the source is a local path or because the backend only
-/// accepts raw bytes.
+/// One input/reference image for image-to-video or image editing. `source` is
+/// what the caller typed (URL or path); `bytes` is filled in when the file had
+/// to be read, either because the source is a local path or because the backend
+/// only accepts raw bytes.
 pub const InputImage = struct {
     source: []const u8,
     bytes: ?[]const u8 = null,
@@ -281,8 +294,8 @@ pub const GenRequest = struct {
     resolution: ?[]const u8 = null,
     /// Aspect-ratio token such as `16:9`.
     ratio: ?[]const u8 = null,
-    /// First-frame / reference image (image-to-video).
-    image: ?InputImage = null,
+    /// Input/reference images. Most backends accept at most one; Qwen accepts ten.
+    images: []const InputImage = &.{},
     /// Provider watermark. Ark defaults it to *on* for images and *off* for
     /// video, so this is only sent when the caller decides.
     watermark: ?bool = null,
@@ -364,6 +377,11 @@ test "backend routing metadata" {
     try std.testing.expect(!BackendKind.seedance.assetNeedsAuth());
     try std.testing.expectEqual(InputImageStyle.bytes_base64, BackendKind.gemini_video.inputImageStyle());
     try std.testing.expectEqual(InputImageStyle.bytes_base64, BackendKind.ltx2_video.inputImageStyle());
+    try std.testing.expectEqual(InputImageStyle.bytes_base64, BackendKind.qwen_image.inputImageStyle());
     try std.testing.expectEqual(InputImageStyle.url_or_data_url, BackendKind.seedance.inputImageStyle());
     try std.testing.expectEqual(InputImageStyle.unsupported, BackendKind.openai_image.inputImageStyle());
+    try std.testing.expectEqual(InputImageStyle.unsupported, BackendKind.azure_flux.inputImageStyle());
+    try std.testing.expectEqual(@as(usize, 10), BackendKind.qwen_image.maxInputImages());
+    try std.testing.expectEqual(@as(usize, 1), BackendKind.volcengine_image.maxInputImages());
+    try std.testing.expectEqual(@as(usize, 0), BackendKind.openai_image.maxInputImages());
 }

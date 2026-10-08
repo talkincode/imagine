@@ -52,7 +52,7 @@ pub fn buildBody(allocator: std.mem.Allocator, req: types.GenRequest) ![]u8 {
         // the generic downloader keeps every backend's payload path identical.
         .response_format = "url",
         .watermark = req.watermark,
-        .image = if (req.image) |img| try imageRef(allocator, img) else null,
+        .image = if (req.images.len > 0) try imageRef(allocator, req.images[0]) else null,
     };
 
     return std.json.Stringify.valueAlloc(allocator, body, .{ .emit_null_optional_fields = false });
@@ -113,7 +113,7 @@ test "volcengine_image sends a reference image as a data URL" {
     const req = types.GenRequest{
         .prompt = "x",
         .api_model = "m",
-        .image = .{ .source = "ref.png", .bytes = "hi", .mime = "image/png" },
+        .images = &.{.{ .source = "ref.png", .bytes = "hi", .mime = "image/png" }},
     };
     const body = try buildBody(a, req);
     defer a.free(body);

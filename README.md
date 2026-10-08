@@ -141,7 +141,7 @@ imagine version | help
 | `--quality <q>` | `low` / `medium` / `high` / `auto` (`openai_image`) |
 | `--seed <int>` | Seed (where supported) |
 | `--steps <n>` | Denoising steps for `qwen_image` (`num_inference_steps`) |
-| `--image <path\|url>` | First-frame / reference image (image-to-video, Seedream editing) |
+| `--image <path\|url>` | Input/reference image; Qwen accepts up to 10 (repeat the flag), other backends at most one |
 | `--watermark` / `--no-watermark` | Force the provider watermark on/off (Ark) |
 | `--duration <sec>` | Clip length in seconds (video) |
 | `--resolution <r>` | `480p` / `720p` / `1080p` / `4k` (video) |
@@ -199,11 +199,11 @@ it (Seedance 2.5 — Gemini Omni has no container parameter, so it always writes
 
 `--image` accepts a path or an `http(s)` URL. Local files are read and inlined
 (the Ark request body is capped at 64 MB); a URL is passed through where the
-provider accepts one, and fetched by `imagine` where it does not (Gemini only
-takes bytes). The declared image type comes from the file's magic bytes, so an
-extension-less URL works. Backends that take no image input (`openai_image`,
-`azure_flux`, `qwen_image`) reject `--image` with a usage error rather than
-ignoring it.
+provider accepts one, and fetched by `imagine` where it does not (Gemini, LTX-2,
+and Qwen-Image take bytes). The declared image type comes from the file's magic
+bytes, so an extension-less URL works. Qwen-Image sends one reference as `image`
+or multiple references as `images` data URLs. Backends that take no image input (`openai_image`,
+`azure_flux`) reject `--image` with a usage error rather than ignoring it.
 
 `ltx2_video` speaks the same async flow to a service on your own machine
 (text-to-video and image-to-video); nothing leaves the box and no credential is
@@ -329,7 +329,7 @@ time, not as a falsely optimistic model listing.
 |---------|----------------|
 | `openai_image` | `--size` (e.g. `1024x1024`); optional `--format` / `--quality` |
 | `azure_flux` | `--width` / `--height` (and optional `--seed`) |
-| `qwen_image` | `--size` (`WxH` or a native ratio token such as `16:9`), `--steps`, `--seed`, `--format` |
+| `qwen_image` | `--size` (`WxH` or a native ratio token such as `16:9`), `--steps`, `--seed`, `--format`, repeat `--image` up to 10 times for multi-reference editing |
 | `volcengine_image` | `--size` (tier `1K`/`2K`/`4K` or `WxH`), `--format`, `--no-watermark` |
 | `seedance` | `--duration`, `--resolution`, `--ratio`, `--image`, `--no-watermark` |
 | `gemini_video` | `--duration`, `--resolution`, `--ratio`, `--image`, `--seed` |
@@ -369,6 +369,11 @@ steps = 20
 ```bash
 imagine generate -m qwen-image-2.1 -p "a neon shop sign reading QWEN IMAGE 2.1" -o sign.png
 imagine generate -m qwen-image-2.1 -p "a wide sticker sheet of dragons" --size 16:9 --steps 20 -o wide.png
+# Edit from one or more reference images
+imagine generate -m qwen-image-2.1 --image photo.png \
+  -p "Replace the background with a sunset beach" -o edited.png
+imagine generate -m qwen-image-2.1 --image subject.png --image style.png \
+  -p "Place the subject in the second image's style" -o composite.png
 ```
 
 `--size` also accepts the model's native ratio tokens (`1:1`, `4:3`, `3:4`,
@@ -422,13 +427,16 @@ imagine generate -m ltx-2 --image fox.png -p "the fox turns to camera" -o turn.m
     { "model": "doubao-seedance-2-5-260628", "prompt": "a fox in snow", "output": "out/fox.mp4",
       "duration": 5, "resolution": "720p", "ratio": "16:9" },
     { "model": "gemini-omni-1.1-flash", "prompt": "the fox turns", "output": "out/turn.mp4",
-      "image": "fox.png", "resolution": "1080p" }
+      "image": "fox.png", "resolution": "1080p" },
+    { "model": "qwen-image-2.1", "prompt": "combine the references", "output": "out/composite.png",
+      "images": ["subject.png", "style.png"] }
   ]
 }
 ```
 
 Per-job keys: `model, prompt, output, size, width, height, n, format, compression, quality,
-seed, steps, duration, resolution, ratio, image, watermark`.
+seed, steps, duration, resolution, ratio, image, images, watermark`. Use `image` for one
+reference on any supported backend; `images` is the Qwen-Image multi-reference form (up to 10).
 Use model names from `imagine models` (config models or built-in presets).
 `--poll-interval` / `--timeout` apply to every video job in the manifest, and a
 manifest whose jobs reach credentialed endpoints needs `--authorize-spend`

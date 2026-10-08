@@ -54,7 +54,8 @@ pub fn buildBody(allocator: std.mem.Allocator, req: types.GenRequest) ![]u8 {
 
     var content = std.ArrayList(Content).empty;
     try content.append(allocator, .{ .type = "text", .text = req.prompt });
-    if (req.image) |img| {
+    if (req.images.len > 0) {
+        const img = req.images[0];
         try content.append(allocator, .{
             .type = "image_url",
             .image_url = .{ .url = try imageRef(allocator, img) },
@@ -188,7 +189,7 @@ test "seedance maps --size ratio tokens and first-frame images" {
         .prompt = "x",
         .api_model = "m",
         .size = "9:16",
-        .image = .{ .source = "https://example.com/first.png" },
+        .images = &.{.{ .source = "https://example.com/first.png" }},
     };
     const body = try buildBody(a, req);
     defer a.free(body);
@@ -204,7 +205,7 @@ test "seedance encodes a local first-frame image as a data URL" {
     const req = types.GenRequest{
         .prompt = "x",
         .api_model = "m",
-        .image = .{ .source = "first.jpg", .bytes = "hi", .mime = "image/jpeg" },
+        .images = &.{.{ .source = "first.jpg", .bytes = "hi", .mime = "image/jpeg" }},
     };
     const body = try buildBody(a, req);
     defer a.free(body);

@@ -201,7 +201,7 @@ pub fn generate(
         error.OutOfMemory => return error.OutOfMemory,
         error.InputImageNotFetched => return .{ .err = try std.fmt.allocPrint(
             allocator,
-            "backend {s} needs the first-frame image as bytes; re-run with a local file or a fetchable URL",
+            "backend {s} needs the --image input as bytes; re-run with a local file or a fetchable URL",
             .{model.backend.toString()},
         ) },
     };

@@ -121,14 +121,15 @@ Qwen-specific syntax:
 | `-s, --size` | `size` | `WIDTHxHEIGHT` or an aspect-ratio token (below); server default 1024x1024 |
 | `--width/--height` | `size` | combined into `WIDTHxHEIGHT` |
 | `-n, --n` | `n` (per call: 1) | imagine fans `-n` into parallel calls, `-c` sets the fan-out |
+| repeated `--image` | `image` (one) / `images` (multiple) | up to 10 edit references; local files and fetched URLs are inlined |
 | `--steps` | `num_inference_steps` | denoising steps; server default 40 |
 | `--seed` | `seed` | reproducible output |
 | `--format` | `output_format` | `png` (keeps RGBA) / `webp` (keeps RGBA) / `jpeg` (flattens onto white) |
 | `--compression` | `output_compression` | `0-100`; PNG encode level, JPEG/WebP quality |
 | `--quality` | *(not sent)* | Qwen-Image quality is a function of `--steps` |
 
-`imagine --dry-run` prints the exact body, and `--json` reports per-image
-results and errors, for both servers.
+`imagine --dry-run` prints the request body with inline image bytes elided, and
+`--json` reports per-image results and errors, for both servers.
 
 ### Native aspect ratios
 
@@ -158,31 +159,25 @@ imagine generate -m qwen-image-2.1 -o sticker.png --steps 40 \
   -p "This is an RGBA image with transparency. A cute cartoon dragon sticker. The image has alpha channel and the background is transparent."
 ```
 
-## 4. Editing (not reachable from the CLI yet)
+## 4. Image editing
 
-Qwen-Image-2.1 is a unified generate/edit model: it accepts up to 10 reference
-images plus a prompt. `server.py` supports that today on the same endpoint —
-`image` (one) or `images` (list) as base64 or `data:` URLs — but `imagine` has
-no input-image parameter yet (see the roadmap item "input image / mask 参数通路"
-in `AGENT.md`).
+Qwen-Image-2.1 is a unified generate/edit model. Repeat `--image` for up to 10
+reference images; local files are inlined and URL inputs are fetched before the
+request reaches the server:
 
 ```bash
-# Direct call, until the CLI grows an --input parameter:
-python3 - <<'PY'
-import base64, json, urllib.request
-payload = {
-    "prompt": "Change the background to a sunset beach",
-    "image": "data:image/png;base64," + base64.b64encode(open("input.png", "rb").read()).decode(),
-    "num_inference_steps": 40,
-    "output_format": "png",
-}
-req = urllib.request.Request(
-    "http://127.0.0.1:8000/v1/images/generations",
-    data=json.dumps(payload).encode(), headers={"Content-Type": "application/json"},
-)
-open("edited.png", "wb").write(base64.b64decode(json.load(urllib.request.urlopen(req))["data"][0]["b64_json"]))
-PY
+# One reference
+imagine generate -m qwen-image-2.1 --image input.png \
+  -p "Change the background to a sunset beach" -o edited.png
+
+# Multiple references
+imagine generate -m qwen-image-2.1 --image subject.png --image style.png \
+  -p "Combine the subject with the style of the second image" -o composite.png
 ```
+
+For one reference, imagine sends the server's `image` string field; for multiple
+references it sends an `images` array of data URLs. The bundled server accepts
+up to 10 references per request.
 
 Editing is where the model's prefix KV cache pays off; vLLM-Omni is the faster
 server for it.

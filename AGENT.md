@@ -47,7 +47,7 @@
 | `http.zig` | `std.http.Client` 薄封装：`post`/`get` → `Response{status,body}` | 不懂任何模型语义 |
 | `backends/openai_image.zig` | OpenAI-compatible `/v1/images/generations` 请求体（`size` 字符串） | 只构造 body，不发请求 |
 | `backends/azure_flux.zig` | Azure FLUX 请求体（`width`/`height`，可选 `seed`） | 同上 |
-| `backends/qwen_image.zig` | Qwen-Image 请求体（`size` 像素串或原生比例 token、`steps`、`seed`），调本地/自托管 server | 同上 |
+| `backends/qwen_image.zig` | Qwen-Image 请求体（`size` 像素串或原生比例 token、`steps`、`seed`、单张 `image` 或多张 `images[]` 参考图），调本地/自托管 server | 同上 |
 | `backends/volcengine_image.zig` | 火山方舟 Seedream 请求体（`size` 档位或像素、`watermark`、`image` 参考图；无 `n`/`seed`） | 同上 |
 | `backends/seedance.zig` | 火山方舟 Seedance 建任务体 + `parseCreate`/`pollUrl`/`parsePoll`（`content[]`、`status` 终态判定） | 不发起请求、不下载 |
 | `backends/gemini_video.zig` | Gemini Interactions API（Omni）建任务体 + 三个解析器（`steps[].content[].uri`、Files `state`、下载 URL） | 同上 |
@@ -61,8 +61,8 @@
 
 ### 新增一个后端的步骤
 1. 在 `types.zig` 的 `BackendKind` 增加变体（及 `fromString` 别名），并补齐路由元数据：
-   `media()`、`flow()`、`defaultKeyEnv()`、`assetNeedsAuth()`、`inputImageStyle()`
-   （`unsupported` 表示该后端不接受 `--image`，CLI 会直接报用法错误而不是静默忽略）。
+   `media()`、`flow()`、`defaultKeyEnv()`、`assetNeedsAuth()`、`inputImageStyle()`、
+   `maxInputImages()`（`unsupported`/最大数为 0 表示不接受 `--image`，CLI 会报用法错误）。
 2. 在 `src/backends/` 新增 `your_provider.zig`，实现 `buildBody(allocator, req) ![]u8`
    （异步后端这里就是"建任务"体）。
 3. 在 `backend.zig` 的 `buildBody` dispatch 增加一个 switch 分支；
@@ -129,6 +129,7 @@ watermark = false # 火山方舟：图像默认 true，视频默认 false
 | `defaultKeyEnv()` | ephemeral 模式未指定 `IMAGINE_API_KEY_ENV` 时的凭证 env（Ark→`ARK_API_KEY`、Gemini→`GEMINI_API_KEY`、LTX-2→`LTX2_API_KEY`，其余→`AZURE_OPENAI_APIKEY`） |
 | `assetNeedsAuth()` | 产物 URL 是否必须带凭证下载（Gemini Files 需要；Ark/Azure 的预签名 URL 不能带，Azure 会因 SAS + Authorization 同时出现而拒绝；本地 LTX-2 服务不需要） |
 | `inputImageStyle()` | 统一 `--image` 如何传给 provider：`url_or_data_url` / `bytes_base64` |
+| `maxInputImages()` | 每个请求最多接收的 `--image` 数量（Qwen=10，其他支持图片输入的后端=1，不支持=0） |
 
 ### 内置 presets（`presets.zig`）
 
@@ -172,7 +173,7 @@ ARK_API_KEY=... imagine generate -m doubao-seedance-2-5-260628 -p "a fox" -o fox
 ```
 imagine generate -m <model> -p <prompt> [-o -n -s --width --height \
         --format --compression --quality --seed --steps \
-        --image --watermark/--no-watermark \
+        --image [重复；Qwen 最多 10 张] --watermark/--no-watermark \
         --duration --resolution --ratio --poll-interval --timeout \
         -c --config --json --dry-run --authorize-spend -q]
 imagine batch <manifest.json> [-c --poll-interval --timeout --json --authorize-spend]
@@ -185,7 +186,7 @@ imagine version | help
 - `--json` 结果对象：
   `{ ok, media, model, backend, requested, succeeded, failed, images:[{path,bytes}], videos:[{path,bytes}], errors:[] }`。
   `media` = `image` | `video`，产物落在对应数组，另一个恒为空数组（形状稳定，便于 agent 解析）。
-- batch manifest 每个 job 额外支持 `duration`、`resolution`、`ratio`、`image`、`watermark`；
+- batch manifest 每个 job 额外支持 `duration`、`resolution`、`ratio`、`image`（单张）/`images`（Qwen 多参考图）、`watermark`；
   `--json` 的 `tasks[]` 每项带 `media`。
 - 多张图/多条视频 → 文件名自动加 `-1 -2 …` 数字后缀；`-n` 对视频是"发起 n 个 provider 任务"。
 - 异步后端把 provider 的失败（HTTP 200 + `status: failed`）如实转成 `errors[]` 文案，
@@ -232,8 +233,9 @@ imagine version | help
 - **显式花钱授权**：`--authorize-spend` / `IMAGINE_AUTHORIZE_SPEND=1`，见 §5。
 - **模型可用性语义修正**：`ready` 布尔值换成 `credential_status` + `availability=unknown`。
 - **Qwen-Image-2.1 可选集成**：`qwen_image` 后端（统一参数 → `size`/`num_inference_steps`/
-  `seed`/`output_format`）、`auth = "none"` 无鉴权端点、`--steps` 与 `IMAGINE_STEPS`，
-  以及 `integrations/qwen-image/`（diffusers server + 安装脚本 + 文档）；同一契约也兼容
+  `seed`/`output_format`；重复 `--image` 支持最多 10 张参考图，URL 在 imagine 侧下载并以内联
+  data URL 发送）、`auth = "none"` 无鉴权端点、`--steps` 与 `IMAGINE_STEPS`，以及
+  `integrations/qwen-image/`（diffusers server + 安装脚本 + 文档）；同一生成契约也兼容
   vLLM-Omni 的 `/v1/images/generations`。
 
 **近期**
@@ -241,8 +243,8 @@ imagine version | help
 - Veo（`generateContent` + `:predictLongRunning`）——与 Omni 的 Interactions API 是两套
   协议，需要独立后端，暂未接入。
 - 更多后端：Google Gemini 图像、Stability、Replicate。
-- 图生图 / 编辑（input image、mask）参数通路；`integrations/qwen-image` 的 server 已
-  支持 `image`/`images`，CLI 参数补齐后即可直接接上 Qwen-Image-2.1 的编辑能力。
+- Qwen-Image 局部编辑 mask 参数通路；普通参考图编辑与多参考图 `images[]` 已由重复 `--image`
+  接入，mask 仍需贯通 CLI 与 bundled server。
 - 视频续写/编辑（Omni 的 `previous_interaction_id`、Seedance 的 `last_frame`）、
   异步任务的 webhook（`callback_url`）与本地任务缓存（同 id 断点续传）。
 
