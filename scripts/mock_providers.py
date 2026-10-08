@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 """Test double for the provider HTTP surfaces `imagine` speaks.
 
-This stands in for Volcengine Ark, Google Gemini and a self-hosted LTX-2 service
-so `scripts/e2e.sh` can exercise the real client path — create, poll, download,
-file writes, `--json` output — without a network or a credential. It implements
-the documented wire formats; it deliberately does not validate them. Its job is
-to test *imagine*, not the providers, so if a provider changes its API only the
-real API will say so.
+This stands in for Volcengine Ark, Google Gemini, Qwen-Image, and a self-hosted
+LTX-2 service. It lets `scripts/e2e.sh` exercise the real client path (create,
+poll, download, file writes, and `--json`) without a network or credential. It
+implements the documented wire formats; it deliberately does not validate them.
+Its job is to test *imagine*, not the providers, so if a provider changes its API
+only the real API will say so.
 
 Usage: mock_providers.py [port] [logfile]
 Prints the port it bound to on stdout, then serves until killed.
@@ -18,6 +18,7 @@ GET  /api/v3/contents/generations/tasks/cgt-mock-1 -> running, then succeeded + 
 POST /fail/contents/generations/tasks              -> task that always fails
 POST /slow/contents/generations/tasks              -> task that never finishes
 POST /api/v3/images/generations                    -> {"data": [{"url": ...}]}  (Seedream)
+POST /qwen/v1/images/generations                   -> {"data": [{"b64_json": ...}]} (Qwen-Image)
 POST /v1beta/interactions                          -> interaction with a Files uri (Omni)
 POST /array-error/interactions                     -> 400 with an array-wrapped error
 GET  /v1beta/files/mockfile                        -> PROCESSING, then ACTIVE
@@ -28,6 +29,7 @@ POST /ltx-fail/videos/generations                  -> task that always fails
 GET  /cdn/*                                        -> asset bytes (no auth needed)
 """
 
+import base64
 import json
 import sys
 import threading
@@ -35,6 +37,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 SEEDANCE_MP4 = b"SEEDANCE-MP4-BYTES"
 SEEDREAM_PNG = b"SEEDREAM-PNG-BYTES"
+QWEN_PNG = b"QWEN-PNG-BYTES"
 OMNI_MP4 = b"GEMINI-OMNI-MP4-BYTES"
 LTX_MP4 = b"LTX2-MP4-BYTES"
 PNG_MAGIC = b"\x89PNG\r\n\x1a\n" + b"0" * 32
@@ -96,6 +99,11 @@ class Handler(BaseHTTPRequestHandler):
                 "model": "mock", "created": 1,
                 "data": [{"url": f"http://{self.host()}/cdn/seedream.png"}],
             })
+        if self.path == "/qwen/v1/images/generations":
+            return self.send(200, {
+                "model": "mock", "created": 1,
+                "data": [{"b64_json": base64.b64encode(QWEN_PNG).decode("ascii")}],
+            })
         if self.path == "/ltx-fail/videos/generations":
             return self.send(200, {"id": "ltx-fail"})
         if self.path == "/v1/videos/generations":
@@ -156,7 +164,7 @@ class Handler(BaseHTTPRequestHandler):
             return self.send(200, SEEDANCE_MP4, "video/mp4")
         if self.path == "/cdn/seedream.png":
             return self.send(200, SEEDREAM_PNG, "image/png")
-        if self.path == "/cdn/first-frame":
+        if self.path in ("/cdn/first-frame", "/cdn/qwen-reference"):
             # A real image with no filename extension, so the client has to
             # sniff the type from the bytes.
             return self.send(200, PNG_MAGIC, "application/octet-stream")

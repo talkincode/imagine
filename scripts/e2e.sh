@@ -2,7 +2,8 @@
 # End-to-end check of the generation paths that unit tests cannot reach: the
 # real HTTP client, the async create -> poll -> download loop, file writes and
 # `--json` output. A local test double (scripts/mock_providers.py) stands in for
-# Volcengine Ark and Google Gemini, so this needs no network and no credential.
+# Volcengine Ark, Google Gemini, Qwen-Image, and self-hosted LTX-2, so this
+# needs no network and no credential.
 #
 #   scripts/e2e.sh                  # builds with `zig build` first
 #   scripts/e2e.sh zig-out/bin/imagine
@@ -109,6 +110,16 @@ base_url = "$base/api/v3/images/generations"
 api_key = "ark-test-key"
 [models."seedream".defaults]
 size = "2K"
+
+[models."qwen"]
+backend = "qwen_image"
+api_model = "Qwen/Qwen-Image-2.1"
+[[models."qwen".endpoints]]
+base_url = "$base/qwen/v1/images/generations"
+auth = "none"
+[models."qwen".defaults]
+size = "1024x1024"
+steps = 10
 TOML
 
 mkdir -p "$work/out"
@@ -219,6 +230,95 @@ for line in open('$work/requests.log'):
         b = json.loads(r['body'])
         print(b['size'], b['watermark'], 'seed' not in b and 'n' not in b); break
 ")"
+
+echo "--- qwen_image: edit with local and URL reference images"
+"$bin" generate -m qwen -p "change the background" --image "$work/first.png" \
+    --size 16:9 --steps 20 -o "$work/out/qwen-edit.png" \
+    --config "$work/config.toml" --json > "$work/r.json"; rc_qwen=$?
+check "local edit exit code" 0 "$(rc $rc_qwen)"
+check "local edit output" "QWEN-PNG-BYTES" "$(cat "$work/out/qwen-edit.png")"
+check "local edit media" image "$(field "$work/r.json" "d['media']")"
+check "single reference sent as a data URL" True \
+    "$(python3 -c "
+import json
+requests = [json.loads(line) for line in open('$work/requests.log')]
+request = next(
+    r for r in requests
+    if r['method'] == 'POST'
+    and r['path'] == '/qwen/v1/images/generations'
+)
+body = json.loads(request['body'])
+print(
+    body['model'] == 'Qwen/Qwen-Image-2.1'
+    and body['size'] == '2752x1536'
+    and body['num_inference_steps'] == 20
+    and body['image'] == 'data:image/png;base64,UE5HREFUQQ=='
+)
+")"
+check "keyless Qwen endpoint gets no credential" "None" \
+    "$(python3 -c "
+import json
+for line in open('$work/requests.log'):
+    r = json.loads(line)
+    if r['method'] == 'POST' and r['path'] == '/qwen/v1/images/generations':
+        print(r['authorization']); break
+")"
+"$bin" generate -m qwen -p "combine the references" \
+    --image "$work/first.png" --image "$base/cdn/qwen-reference" \
+    -o "$work/out/qwen-multi.png" --config "$work/config.toml" --json > "$work/r.json"; rc_qwen_multi=$?
+check "multi-reference edit exit code" 0 "$(rc $rc_qwen_multi)"
+check "multi-reference output" "QWEN-PNG-BYTES" "$(cat "$work/out/qwen-multi.png")"
+check "local and URL references sent as an images array" True \
+    "$(python3 -c "
+import base64,json
+requests = [json.loads(line) for line in open('$work/requests.log')]
+post = next(
+    r for r in requests
+    if r['method'] == 'POST'
+    and r['path'] == '/qwen/v1/images/generations'
+    and json.loads(r['body'])['prompt'] == 'combine the references'
+)
+body = json.loads(post['body'])
+refs = body['images']
+remote_bytes = base64.b64decode(refs[1].split(',', 1)[1])
+fetched = any(r['method'] == 'GET' and r['path'] == '/cdn/qwen-reference' for r in requests)
+png_magic = bytes((137, 80, 78, 71, 13, 10, 26, 10))
+print(len(refs) == 2 and refs[0] == 'data:image/png;base64,UE5HREFUQQ==' and fetched and refs[1].startswith('data:image/png;base64,') and remote_bytes.startswith(png_magic))
+")"
+"$bin" generate -m qwen -p "dry run multiref" --image "$work/first.png" --image "$work/first.png" \
+    --dry-run --config "$work/config.toml" > "$work/qwen-dry.txt" 2>&1
+check "dry-run elides each reference payload" True \
+    "$(python3 -c "print(open('$work/qwen-dry.txt').read().count('bytes of base64 elided') == 2)")"
+cat > "$work/qwen-jobs.json" <<JSON
+{ "jobs": [ { "model": "qwen", "prompt": "batch combine",
+               "images": ["$work/first.png", "$work/first.png"],
+               "output": "$work/out/qwen-batch.png" } ] }
+JSON
+"$bin" batch "$work/qwen-jobs.json" --config "$work/config.toml" --json > "$work/r.json"; rc_qwen_batch=$?
+check "batch multi-reference exit code" 0 "$(rc $rc_qwen_batch)"
+check "batch multi-reference output" "QWEN-PNG-BYTES" "$(cat "$work/out/qwen-batch.png")"
+check "batch images array reaches Qwen" 2 \
+    "$(python3 -c "
+import json
+for line in open('$work/requests.log'):
+    r = json.loads(line)
+    if r['method'] == 'POST' and r['path'] == '/qwen/v1/images/generations' and json.loads(r['body'])['prompt'] == 'batch combine':
+        print(len(json.loads(r['body'])['images'])); break
+")"
+set --
+i=0
+while [ "$i" -lt 11 ]; do
+    set -- "$@" --image "$work/first.png"
+    i=$((i + 1))
+done
+set +e
+"$bin" generate -m qwen -p "too many references" "$@" --config "$work/config.toml" \
+    > "$work/qwen-too-many.txt" 2>&1
+rc_qwen_many=$?
+set -e
+check "more than 10 Qwen references is rejected" 2 "$rc_qwen_many"
+check "Qwen reference limit is explained" True \
+    "$(grep -q 'accepts at most 10 --image input' "$work/qwen-too-many.txt" && echo True || echo False)"
 
 echo "--- -n fans out into independent tasks with numbered paths"
 "$bin" generate -m seedance -p x -n 2 -o "$work/out/two.mp4" -c 2 \

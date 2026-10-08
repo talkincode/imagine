@@ -61,7 +61,8 @@ const Body = struct {
 
 pub fn buildBody(allocator: std.mem.Allocator, req: types.GenRequest) ![]u8 {
     var parts = std.ArrayList(InputPart).empty;
-    if (req.image) |img| {
+    if (req.images.len > 0) {
+        const img = req.images[0];
         // The bytes are guaranteed by `backend.resolveInputImage`: this backend
         // declares `bytes_base64` and never sees a bare URL.
         const bytes = img.bytes orelse return error.InputImageNotFetched;
@@ -310,7 +311,7 @@ test "gemini_video sends a first-frame image as inline base64" {
     const req = types.GenRequest{
         .prompt = "x",
         .api_model = "m",
-        .image = .{ .source = "first.png", .bytes = "hi", .mime = "image/png" },
+        .images = &.{.{ .source = "first.png", .bytes = "hi", .mime = "image/png" }},
     };
     const body = try buildBody(a, req);
     defer a.free(body);

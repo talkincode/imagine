@@ -1,5 +1,5 @@
-//! Qwen-Image text-to-image (`QwenImage21Pipeline`, 2.1 default) served by a
-//! local OpenAI-compatible endpoint.
+//! Qwen-Image text-to-image and multi-reference editing (`QwenImage21Pipeline`,
+//! 2.1 default) served by a local OpenAI-compatible endpoint.
 //!
 //! Image quality here is a function of denoising steps, not of a `quality`
 //! label, so this backend sends `num_inference_steps` (the unified `--steps`)
@@ -12,11 +12,14 @@
 //! Both accept
 //! `{model, prompt, n, size, num_inference_steps, seed, output_format,
 //! output_compression}` and answer with the OpenAI `{ "data": [...] }` shape
-//! that `backend.parseResponse` already decodes. Because the two servers speak
-//! the same contract, the same command works against either one.
+//! that `backend.parseResponse` already decodes. The bundled server accepts one
+//! `image` or an `images` list for editing; `imagine` fetches URL inputs and sends
+//! their bytes inline. Because the servers speak the same generation contract,
+//! the same text-to-image command works against either one.
 
 const std = @import("std");
 const types = @import("../types.zig");
+const util = @import("../util.zig");
 
 /// Native 2K shapes from the Qwen-Image-2.1 model card. Accepting the ratio
 /// token (e.g. `--size 16:9`) here, in the client, keeps the wire format
@@ -61,6 +64,8 @@ pub fn buildBody(allocator: std.mem.Allocator, req: types.GenRequest) ![]u8 {
     const Body = struct {
         model: []const u8,
         prompt: []const u8,
+        image: ?[]const u8,
+        images: ?[]const []const u8,
         n: u32,
         size: ?[]const u8,
         num_inference_steps: ?u32,
@@ -71,9 +76,21 @@ pub fn buildBody(allocator: std.mem.Allocator, req: types.GenRequest) ![]u8 {
 
     var size_buf: [32]u8 = undefined;
 
+    var image: ?[]const u8 = null;
+    var images: ?[]const []const u8 = null;
+    if (req.images.len == 1) {
+        image = try imageRef(allocator, req.images[0]);
+    } else if (req.images.len > 1) {
+        const refs = try allocator.alloc([]const u8, req.images.len);
+        for (req.images, 0..) |img, i| refs[i] = try imageRef(allocator, img);
+        images = refs;
+    }
+
     const body = Body{
         .model = req.api_model,
         .prompt = req.prompt,
+        .image = image,
+        .images = images,
         .n = req.n,
         .size = resolveSize(&size_buf, req),
         .num_inference_steps = req.steps,
@@ -83,6 +100,13 @@ pub fn buildBody(allocator: std.mem.Allocator, req: types.GenRequest) ![]u8 {
     };
 
     return std.json.Stringify.valueAlloc(allocator, body, .{ .emit_null_optional_fields = false });
+}
+
+/// The Qwen server accepts reference images as base64 or `data:` URLs, not
+/// remote URLs. `inputImageStyle()` ensures the bytes have been fetched first.
+fn imageRef(allocator: std.mem.Allocator, img: types.InputImage) ![]const u8 {
+    const bytes = img.bytes orelse return error.InputImageNotFetched;
+    return util.dataUrlAlloc(allocator, bytes, img.mime);
 }
 
 // ---- tests ----
@@ -133,7 +157,44 @@ test "qwen_image sends steps/seed/format and omits nulls" {
     try std.testing.expect(std.mem.indexOf(u8, body, "quality") == null);
 }
 
-test "qwen_image omits size/steps/seed when unset" {
+test "qwen_image sends a local reference as a data URL" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const req = types.GenRequest{
+        .prompt = "replace the background",
+        .api_model = "m",
+        .images = &.{.{ .source = "ref.png", .bytes = "hi", .mime = "image/png" }},
+    };
+    const body = try buildBody(arena.allocator(), req);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"image\":\"data:image/png;base64,aGk=\"") != null);
+}
+
+test "qwen_image sends multiple references in the images array" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const req = types.GenRequest{
+        .prompt = "combine these",
+        .api_model = "m",
+        .images = &.{
+            .{ .source = "one.png", .bytes = "a", .mime = "image/png" },
+            .{ .source = "two.jpg", .bytes = "b", .mime = "image/jpeg" },
+        },
+    };
+    const body = try buildBody(arena.allocator(), req);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"images\":[\"data:image/png;base64,YQ==\",\"data:image/jpeg;base64,Yg==\"]") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"image\":") == null);
+}
+
+test "qwen_image requires input bytes before building the request" {
+    const req = types.GenRequest{
+        .prompt = "edit",
+        .api_model = "m",
+        .images = &.{.{ .source = "https://example.com/ref.png" }},
+    };
+    try std.testing.expectError(error.InputImageNotFetched, buildBody(std.testing.allocator, req));
+}
+
+test "qwen_image omits size/steps/seed/images when unset" {
     const a = std.testing.allocator;
     const req = types.GenRequest{ .prompt = "x", .api_model = "m" };
     const body = try buildBody(a, req);
@@ -141,4 +202,5 @@ test "qwen_image omits size/steps/seed when unset" {
     try std.testing.expect(std.mem.indexOf(u8, body, "size") == null);
     try std.testing.expect(std.mem.indexOf(u8, body, "num_inference_steps") == null);
     try std.testing.expect(std.mem.indexOf(u8, body, "seed") == null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "image") == null);
 }

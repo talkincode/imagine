@@ -32,8 +32,8 @@ pub const Generate = struct {
     resolution: ?[]const u8 = null,
     /// Video: aspect-ratio token (`16:9`, `9:16`, ...).
     ratio: ?[]const u8 = null,
-    /// First-frame / reference image: a path or an http(s) URL.
-    image: ?[]const u8 = null,
+    /// Repeatable input/reference images: paths or http(s) URLs.
+    images: []const []const u8 = &.{},
     /// Ark watermark; unset leaves the provider default alone.
     watermark: ?bool = null,
     /// Async video tasks: seconds between status polls.
@@ -169,7 +169,7 @@ pub const usage =
     \\      --quality <q>         low | medium | high | auto   (openai_image)
     \\      --seed <int>          Seed (where supported)
     \\      --steps <n>           Denoising steps (qwen_image num_inference_steps)
-    \\      --image <path|url>    First-frame / reference image (image-to-video)
+    \\      --image <path|url>    Repeat for Qwen-Image (max 10); one for other backends
     \\      --watermark           Force the provider watermark on
     \\      --no-watermark        Force the provider watermark off
     \\  -c, --concurrency <num>   Parallel requests (default: endpoint count)
@@ -227,7 +227,7 @@ pub const usage =
     \\  ephemeral env when no config file exists. Run `imagine models`.
     \\  backends: openai_image     (OpenAI-compatible /v1/images/generations)
     \\            azure_flux       (Azure FLUX; uses --width/--height)
-    \\            qwen_image       (local Qwen-Image server; uses --size/--steps)
+    \\            qwen_image       (local Qwen-Image server; --size/--steps/--image edit)
     \\            volcengine_image (Ark Seedream image; env ARK_API_KEY)
     \\            seedance         (Ark Seedance video; env ARK_API_KEY)
     \\            gemini_video     (Gemini Omni video; env GEMINI_API_KEY)
@@ -265,6 +265,9 @@ pub const usage =
     \\  IMAGINE_BASE_URL=http://127.0.0.1:8000/v1/images/generations \\
     \\  IMAGINE_MODEL=qwen-image-2.1 IMAGINE_BACKEND=qwen_image IMAGINE_AUTH=none \\
     \\    imagine generate -p "a neon Qwen sign" --size 16:9 --steps 40 -o qwen.png
+    \\  IMAGINE_BASE_URL=http://127.0.0.1:8000/v1/images/generations \\
+    \\  IMAGINE_MODEL=qwen-image-2.1 IMAGINE_BACKEND=qwen_image IMAGINE_AUTH=none \\
+    \\    imagine generate -p "replace the background" --image photo.png -o edited.png
     \\  # video (Ark Seedance / Gemini Omni) — key from env, model from `imagine models`
     \\  imagine generate -m doubao-seedance-2-5-260628 -p "a fox in snow" \\
     \\    --duration 5 --resolution 720p --ratio 16:9 -o fox.mp4
@@ -353,6 +356,7 @@ fn missingValue(arena: std.mem.Allocator, name: []const u8) !Parsed {
 
 fn parseGenerate(arena: std.mem.Allocator, args: []const []const u8) !Parsed {
     var g = Generate{};
+    var images = std.ArrayList([]const u8).empty;
     var cur = Cursor{ .args = args };
     var positional: ?[]const u8 = null;
 
@@ -397,7 +401,7 @@ fn parseGenerate(arena: std.mem.Allocator, args: []const []const u8) !Parsed {
         } else if (std.mem.eql(u8, name, "--ratio")) {
             g.ratio = (try cur.value(fs, arena)) orelse return missingValue(arena, name);
         } else if (std.mem.eql(u8, name, "--image")) {
-            g.image = (try cur.value(fs, arena)) orelse return missingValue(arena, name);
+            try images.append(arena, (try cur.value(fs, arena)) orelse return missingValue(arena, name));
         } else if (std.mem.eql(u8, name, "--watermark")) {
             g.watermark = true;
         } else if (std.mem.eql(u8, name, "--no-watermark")) {
@@ -428,6 +432,7 @@ fn parseGenerate(arena: std.mem.Allocator, args: []const []const u8) !Parsed {
         }
     }
 
+    g.images = try images.toOwnedSlice(arena);
     if (g.prompt == null) g.prompt = positional;
     // --model is optional when exactly one model is configured (validated in main).
     if (g.prompt == null) return .{ .err = try arena.dupe(u8, "missing required option: --prompt") };
@@ -737,6 +742,19 @@ test "parse generate with flags" {
     try std.testing.expectEqualStrings("a fox", g.prompt.?);
     try std.testing.expectEqual(@as(u32, 3), g.n);
     try std.testing.expectEqualStrings("x.png", g.output.?);
+}
+
+test "parse generate collects repeated --image values" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const p = try parseArgs(arena.allocator(), &.{
+        "generate", "-p", "combine references", "--image", "first.png", "--image=second.jpg",
+    });
+    try std.testing.expect(p == .command);
+    const images = p.command.generate.images;
+    try std.testing.expectEqual(@as(usize, 2), images.len);
+    try std.testing.expectEqualStrings("first.png", images[0]);
+    try std.testing.expectEqualStrings("second.jpg", images[1]);
 }
 
 test "parse generate --steps and reject 0" {

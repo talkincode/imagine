@@ -461,10 +461,8 @@ fn cmdGenerate(ctx: Ctx, g: cli.Generate) !u8 {
         .watermark = g.watermark,
     };
     req.applyDefaults(model.defaults);
-    if (g.image != null and model.backend.inputImageStyle() == .unsupported) {
-        return reportUnsupportedImage(ctx, model.backend);
-    }
-    req.image = readInputImage(ctx, g.image) catch |e| switch (e) {
+    if (!try validateInputImageCount(ctx, model.backend, g.images.len)) return 2;
+    req.images = readInputImages(ctx, g.images) catch |e| switch (e) {
         error.InputImageUnreadable => return 2,
         else => return e,
     };
@@ -480,14 +478,17 @@ fn cmdGenerate(ctx: Ctx, g: cli.Generate) !u8 {
     var client = std.http.Client{ .allocator = ctx.gpa, .io = ctx.io };
     defer client.deinit();
 
-    // A first-frame URL is fetched here when the provider only takes bytes (a
-    // local file was already read above). This must happen before the tasks are
-    // built, because each task takes a copy of the request.
-    if (req.image) |img| {
-        req.image = backend.resolveInputImage(&client, ctx.arena, model.backend, img) catch {
-            try printErr(ctx.io, try std.fmt.allocPrint(ctx.arena, "cannot fetch --image '{s}' for backend {s}\n", .{ img.source, model.backend.toString() }));
-            return 1;
-        };
+    // URLs are fetched here when the provider only takes bytes (local files
+    // were already read above). Resolve all references before tasks copy them.
+    if (req.images.len > 0) {
+        const resolved = try ctx.arena.alloc(types.InputImage, req.images.len);
+        for (req.images, 0..) |img, i| {
+            resolved[i] = backend.resolveInputImage(&client, ctx.arena, model.backend, img) catch {
+                try printErr(ctx.io, try std.fmt.allocPrint(ctx.arena, "cannot fetch --image '{s}' for backend {s}\n", .{ img.source, model.backend.toString() }));
+                return 1;
+            };
+        }
+        req.images = resolved;
     }
 
     // Resolve the output base path and extension: a video model defaults to
@@ -531,17 +532,39 @@ fn cmdGenerate(ctx: Ctx, g: cli.Generate) !u8 {
 fn reportUnsupportedImage(ctx: Ctx, kind: types.BackendKind) !u8 {
     try printErr(ctx.io, try std.fmt.allocPrint(
         ctx.arena,
-        "backend {s} takes no --image input (supported by: seedance, gemini_video, volcengine_image)\n",
+        "backend {s} takes no --image input (supported by: qwen_image up to 10, seedance, gemini_video, volcengine_image, ltx2_video)\n",
         .{kind.toString()},
     ));
     return 2;
 }
 
-/// The create body `--dry-run` prints. An inlined `--image` would put megabytes
-/// of base64 into that output, so its payload is replaced by its byte count;
-/// everything else is verbatim. A body that cannot be built without network
-/// access (a URL image for a bytes-only backend) is reported as a message
-/// instead of a Zig error trace.
+fn validateInputImageCount(ctx: Ctx, kind: types.BackendKind, count: usize) !bool {
+    if (count == 0) return true;
+    const max = kind.maxInputImages();
+    if (max == 0) {
+        _ = try reportUnsupportedImage(ctx, kind);
+        return false;
+    }
+    if (count > max) {
+        _ = try reportTooManyInputImages(ctx, kind, count, max);
+        return false;
+    }
+    return true;
+}
+
+fn reportTooManyInputImages(ctx: Ctx, kind: types.BackendKind, count: usize, max: usize) !u8 {
+    try printErr(ctx.io, try std.fmt.allocPrint(
+        ctx.arena,
+        "backend {s} accepts at most {d} --image input(s); received {d}\n",
+        .{ kind.toString(), max, count },
+    ));
+    return 2;
+}
+
+/// The create body `--dry-run` prints. Inlined `--image` references can put
+/// megabytes of base64 into that output, so each payload is elided; everything
+/// else is verbatim. A body that cannot be built without network access (a URL
+/// image for a bytes-only backend) is reported as a message, not a Zig trace.
 fn dryRunBody(ctx: Ctx, model: *const types.ModelConfig, req: types.GenRequest) ![]const u8 {
     const body = backend.buildBody(model.backend, ctx.arena, req) catch |e| switch (e) {
         error.OutOfMemory => return error.OutOfMemory,
@@ -550,24 +573,33 @@ fn dryRunBody(ctx: Ctx, model: *const types.ModelConfig, req: types.GenRequest) 
             return error.DryRunBodyUnavailable;
         },
     };
-    const bytes = if (req.image) |img| (img.bytes orelse return body) else return body;
-    const b64 = try util.base64EncodeAlloc(ctx.arena, bytes);
-    const at = std.mem.indexOf(u8, body, b64) orelse return body;
-    const note = try std.fmt.allocPrint(ctx.arena, "<{d} bytes of base64 elided>", .{b64.len});
-    return std.fmt.allocPrint(ctx.arena, "{s}{s}{s}", .{ body[0..at], note, body[at + b64.len ..] });
+    var redacted = body;
+    for (req.images) |img| {
+        const bytes = img.bytes orelse continue;
+        if (bytes.len == 0) continue;
+        const b64 = try util.base64EncodeAlloc(ctx.arena, bytes);
+        const at = std.mem.indexOf(u8, redacted, b64) orelse continue;
+        const note = try std.fmt.allocPrint(ctx.arena, "<{d} bytes of base64 elided>", .{b64.len});
+        redacted = try std.fmt.allocPrint(ctx.arena, "{s}{s}{s}", .{ redacted[0..at], note, redacted[at + b64.len ..] });
+    }
+    return redacted;
 }
 
 /// Largest `--image` file read into memory. Ark caps a request body at 64 MB and
 /// a single image at 30 MB; 32 MB leaves room for the prompt and encoding.
 const max_input_image_bytes: usize = 32 * 1024 * 1024;
 
-/// `--image` accepts a path or an http(s) URL. Local files are read here so a
-/// typo fails before any provider request; URLs are left to the backend layer,
-/// which knows whether the provider takes URLs or raw bytes.
-fn readInputImage(ctx: Ctx, source: ?[]const u8) !?types.InputImage {
-    const raw = source orelse return null;
+/// Read each repeated `--image` input. Local files are read here so a typo
+/// fails before any provider request; URLs are left for backend-specific fetch.
+fn readInputImages(ctx: Ctx, sources: []const []const u8) ![]types.InputImage {
+    const images = try ctx.arena.alloc(types.InputImage, sources.len);
+    for (sources, 0..) |source, i| images[i] = try readInputImage(ctx, source);
+    return images;
+}
+
+fn readInputImage(ctx: Ctx, raw: []const u8) !types.InputImage {
     if (util.isHttpUrl(raw)) {
-        return types.InputImage{
+        return .{
             .source = try ctx.arena.dupe(u8, raw),
             .mime = util.mimeForPath(raw),
         };
@@ -577,7 +609,7 @@ fn readInputImage(ctx: Ctx, source: ?[]const u8) !?types.InputImage {
         try printErr(ctx.io, try std.fmt.allocPrint(ctx.arena, "cannot read --image '{s}': {s}\n", .{ path, @errorName(e) }));
         return error.InputImageUnreadable;
     };
-    return types.InputImage{
+    return .{
         .source = path,
         .bytes = bytes,
         // Magic bytes beat the extension: a misnamed file would otherwise be
@@ -694,10 +726,15 @@ fn cmdBatch(ctx: Ctx, b: cli.Batch) !u8 {
             .watermark = jsonBool(job, "watermark"),
         };
         req.applyDefaults(model.defaults);
-        if (jsonStr(job, "image") != null and model.backend.inputImageStyle() == .unsupported) {
-            return reportUnsupportedImage(ctx, model.backend);
-        }
-        req.image = readInputImage(ctx, jsonStr(job, "image")) catch |e| switch (e) {
+        const image_sources = batchImageSources(ctx.arena, job) catch |e| switch (e) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => {
+                try printErr(ctx.io, "each job may specify either 'image' (a string) or 'images' (an array of strings), not both\n");
+                return 1;
+            },
+        };
+        if (!try validateInputImageCount(ctx, model.backend, image_sources.len)) return 2;
+        req.images = readInputImages(ctx, image_sources) catch |e| switch (e) {
             error.InputImageUnreadable => return 2,
             else => return e,
         };
@@ -744,15 +781,18 @@ fn cmdBatch(ctx: Ctx, b: cli.Batch) !u8 {
     var client = std.http.Client{ .allocator = ctx.gpa, .io = ctx.io };
     defer client.deinit();
 
-    // Same rule as `generate`: a first-frame URL is fetched only when the
-    // backend cannot take a URL directly.
+    // Same rule as `generate`: fetch every URL that a backend cannot accept
+    // directly before the scheduler starts.
     for (task_slice) |*t| {
-        if (t.req.image) |img| {
-            t.req.image = backend.resolveInputImage(&client, ctx.arena, t.model.backend, img) catch {
+        if (t.req.images.len == 0) continue;
+        const resolved = try ctx.arena.alloc(types.InputImage, t.req.images.len);
+        for (t.req.images, 0..) |img, i| {
+            resolved[i] = backend.resolveInputImage(&client, ctx.arena, t.model.backend, img) catch {
                 try printErr(ctx.io, try std.fmt.allocPrint(ctx.arena, "cannot fetch --image '{s}' for backend {s}\n", .{ img.source, t.model.backend.toString() }));
                 return 1;
             };
         }
+        t.req.images = resolved;
     }
 
     const conc = chooseConcurrency(b.concurrency, cfg.concurrency, distinctEndpoints(task_slice), task_slice.len);
@@ -1193,6 +1233,44 @@ fn jsonStr(obj: std.json.ObjectMap, key: []const u8) ?[]const u8 {
         .string => |s| s,
         else => null,
     };
+}
+
+fn batchImageSources(arena: Allocator, job: std.json.ObjectMap) ![]const []const u8 {
+    const single = job.get("image");
+    const multiple = job.get("images");
+    const has_single = if (single) |value| value != .null else false;
+    const has_multiple = if (multiple) |value| value != .null else false;
+    if (has_single and has_multiple) return error.ConflictingBatchImages;
+
+    if (single) |value| {
+        if (value != .null) {
+            return switch (value) {
+                .string => |source| blk: {
+                    const sources = try arena.alloc([]const u8, 1);
+                    sources[0] = source;
+                    break :blk sources;
+                },
+                else => error.InvalidBatchImages,
+            };
+        }
+    }
+    if (multiple) |value| {
+        if (value != .null) {
+            const entries = switch (value) {
+                .array => |array| array.items,
+                else => return error.InvalidBatchImages,
+            };
+            const sources = try arena.alloc([]const u8, entries.len);
+            for (entries, 0..) |entry, i| {
+                sources[i] = switch (entry) {
+                    .string => |source| source,
+                    else => return error.InvalidBatchImages,
+                };
+            }
+            return sources;
+        }
+    }
+    return &.{};
 }
 
 fn jsonU32(obj: std.json.ObjectMap, key: []const u8) ?u32 {

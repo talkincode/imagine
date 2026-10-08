@@ -24,9 +24,9 @@ serving stacks, so the two are interchangeable behind one `imagine` backend:
 Errors use the OpenAI body `{"error": {"message": ...}}`, which is what
 `imagine` parses for its `--json` `errors[]` field.
 
-Direct callers (not reachable through `imagine` yet) may also pass `image` or
-`images`: base64 (or `data:image/png;base64,...`) strings of reference images,
-which turns the same request into a Qwen-Image-2.1 edit.
+An optional `image` field or `images` list accepts up to 10 base64 (or
+`data:image/png;base64,...`) reference images for Qwen-Image-2.1 editing.
+`imagine` maps repeated `--image` flags to the matching singular or plural field.
 
 Usage:  python3 server.py [options]     (see --help, or run ./install.sh)
 """

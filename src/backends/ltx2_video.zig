@@ -25,7 +25,8 @@ const Body = struct {
 };
 
 pub fn buildBody(allocator: std.mem.Allocator, req: types.GenRequest) ![]u8 {
-    const image = if (req.image) |img| blk: {
+    const image = if (req.images.len > 0) blk: {
+        const img = req.images[0];
         const bytes = img.bytes orelse return error.InputImageNotFetched;
         break :blk ImageInput{
             .mime_type = img.mime,
@@ -140,7 +141,7 @@ test "ltx2_video body supports text-to-video and first-frame video" {
     const i2v = try buildBody(a, .{
         .prompt = "the fox looks at the camera",
         .api_model = "ltx-2",
-        .image = .{ .source = "first.png", .bytes = "PNG", .mime = "image/png" },
+        .images = &.{.{ .source = "first.png", .bytes = "PNG", .mime = "image/png" }},
     });
     try std.testing.expect(std.mem.indexOf(u8, i2v, "\"image\":{\"mime_type\":\"image/png\",\"data\":\"UE5H\"}") != null);
 }

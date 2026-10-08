@@ -144,7 +144,7 @@ Typical backends:
 |---------|----------|---------------|
 | `openai_image` | OpenAI-compatible `/v1/images/generations` | `--size`, `--format`, `--quality` |
 | `azure_flux` | Azure FLUX | `--width` / `--height`, optional `--seed` |
-| `qwen_image` | Local Qwen-Image-2.1 server (`/v1/images/generations`) | `--size` (`WxH` or ratio token), `--steps`, `--seed`, `--format` |
+| `qwen_image` | Local Qwen-Image-2.1 server (`/v1/images/generations`) | `--size` (`WxH` or ratio token), `--steps`, `--seed`, `--format`, repeat `--image` for up to 10 edit references |
 | `volcengine_image` | Volcengine Ark Seedream (sync) | `--size` (tier `1K`/`2K`/`4K` or `WxH`), `--format`, `--no-watermark`, `--image` |
 | `seedance` | Volcengine Ark video task (async) | `--duration`, `--resolution`, `--ratio`, `--image`, `--no-watermark` |
 | `gemini_video` | Google Gemini Interactions API / Omni (async) | `--duration`, `--resolution`, `--ratio`, `--image`, `--seed` |
@@ -175,9 +175,10 @@ expired task) arrive as HTTP 200 with a failure status and surface in `errors[]`
 with the provider's message.
 
 `--image` accepts a path or an `http(s)` URL. Ark takes URLs and base64 data URLs;
-Gemini and `ltx2_video` take bytes only, so `imagine` downloads the URL first.
-Local files are read and inlined (keep them under ~30 MB). The declared image
-type comes from the file's magic bytes, so an extension-less URL is fine.
+Gemini, `ltx2_video`, and `qwen_image` take bytes only, so `imagine` downloads
+the URL first. Local files are read and inlined (keep them under ~30 MB). The
+declared image type comes from the file's magic bytes, so an extension-less URL
+is fine. For Qwen-Image, repeat `--image` to send up to 10 references for editing.
 
 `--format` picks the container where the provider supports it (Seedance 2.5:
 `mp4` or `mov`). Gemini Omni has no container parameter and always writes
@@ -200,6 +201,10 @@ Then, with no config file at all:
 IMAGINE_BASE_URL=http://127.0.0.1:8000/v1/images/generations \
 IMAGINE_MODEL=qwen-image-2.1 IMAGINE_BACKEND=qwen_image IMAGINE_AUTH=none \
   imagine generate -p "a neon Qwen sign" --size 1024x1024 --steps 20 -o sign.png
+IMAGINE_BASE_URL=http://127.0.0.1:8000/v1/images/generations \
+IMAGINE_MODEL=qwen-image-2.1 IMAGINE_BACKEND=qwen_image IMAGINE_AUTH=none \
+  imagine generate --image subject.png --image style.png \
+    -p "Combine the subject with the style of the second image" -o composite.png
 ```
 
 The server default is **1024x1024** (~1 minute per image on an M2 Ultra); native
@@ -287,7 +292,7 @@ Common options:
 | `--quality` | `low`, `medium`, `high`, or `auto` for `openai_image` output. |
 | `--seed` | Seed where supported. |
 | `--steps` | Denoising steps for `qwen_image` (`num_inference_steps`; server default 40). |
-| `--image` | First-frame / reference image: path or URL. Only for backends that take one (`seedance`, `gemini_video`, `ltx2_video`, `volcengine_image`); others reject it with a usage error. |
+| `--image` | Input/reference image: path or URL. Repeat up to 10 times for `qwen_image`; other supported backends accept one image for editing or image-to-video. Unsupported backends reject it with a usage error. |
 | `--watermark` / `--no-watermark` | Force the Ark watermark on/off. |
 | `--duration` / `--resolution` / `--ratio` | Video length, resolution token, aspect ratio. |
 | `--poll-interval` / `--timeout` | Async video tasks: poll cadence and per-task deadline. |
@@ -355,8 +360,8 @@ imagine batch jobs.json -c 4
 ```
 
 Each job supports: `model`, `prompt`, `output`, `size`, `width`, `height`, `n`,
-`format`, `compression`, `quality`, `seed`, `steps`, and the video keys
-`duration`, `resolution`, `ratio`, `image`, `watermark`:
+`format`, `compression`, `quality`, `seed`, `steps`, `image`, `images`,
+`duration`, `resolution`, `ratio`, `watermark`. Use `images` for up to 10 Qwen references; other backends use one `image`.
 
 ```json
 {
@@ -364,7 +369,9 @@ Each job supports: `model`, `prompt`, `output`, `size`, `width`, `height`, `n`,
     { "model": "doubao-seedance-2-5-260628", "prompt": "a fox in snow",
       "output": "out/fox.mp4", "duration": 5, "resolution": "720p", "ratio": "16:9" },
     { "model": "gemini-omni-1.1-flash", "prompt": "the fox turns",
-      "output": "out/turn.mp4", "image": "fox.png", "resolution": "1080p" }
+      "output": "out/turn.mp4", "image": "fox.png", "resolution": "1080p" },
+    { "model": "qwen-image-2.1", "prompt": "combine these references",
+      "output": "out/composite.png", "images": ["subject.png", "style.png"] }
   ]
 }
 ```
