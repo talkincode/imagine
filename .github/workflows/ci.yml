@@ -113,6 +113,9 @@ jobs:
 
       # Drives the real client path (create -> poll -> download, file writes,
       # --json output) against scripts/mock_providers.py: no network, no keys.
+      - name: Qwen3-TTS adapter regressions
+        run: python3 -m unittest discover -s integrations/qwen3-tts/tests -v
+
       - name: End-to-end
         run: scripts/e2e.sh zig-out/bin/imagine
 
