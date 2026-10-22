@@ -48,11 +48,17 @@ build-svg: ## Build with SVG rendering/composition support via resvg
 .PHONY: test
 test: ## Run unit tests
 	$(ZIG) build test $(SVG_FLAGS)
+	python3 -m unittest discover -s integrations/qwen3-tts/tests -v
+
+.PHONY: test-qwen
+test-qwen: ## Run dependency-free Qwen3-TTS adapter regression tests
+	python3 -m unittest discover -s integrations/qwen3-tts/tests -v
 
 .PHONY: test-core
 test-core: SVG_OVERLAY=0
 test-core: ## Run unit tests without optional SVG/text render support
 	$(ZIG) build test -Dsvg-overlay=false
+	python3 -m unittest discover -s integrations/qwen3-tts/tests -v
 
 .PHONY: test-svg
 test-svg: ## Run tests with SVG rendering/composition support enabled
